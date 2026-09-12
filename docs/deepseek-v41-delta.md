@@ -195,6 +195,66 @@ From the reference (`ref:500-580`, `ref:722-778`):
   and `compress_rope_theta` when the ratio is non-zero, base `rope_theta` and no YaRN
   for the ratio-0 layers.
 
+## Engram: the verified layout, and the exact forward
+
+`tools/make_deepseek_v41_engram.py` reconstructs the two derived pieces of the
+engram path and checks each against a number the checkpoint itself declares --
+no weights involved, and both pass:
+
+| derived artifact | check | result |
+| --- | --- | --- |
+| compressed token map | distinct classes == `engram_compressed_vocab_size` | **99,092 = 99,092** (15,502 classes collapse more than one token, largest 163) |
+| prime bucket layout | the 24 moduli of a layer sum to that layer's declared table rows | **384,006,168** and **384,016,682** = `engram_num_embeddings` |
+
+A wrong normalizer chain or a wrong prime-drawing order would miss those by a
+wide margin, so both reconstructions are pinned to the reference. The map is
+built with the checkpoint's own tokenizer (129,280 ids) over the normalizer chain
+NFKC -> NFD -> strip accents -> lowercase -> collapse whitespace, with a
+private-use sentinel so a one-space token survives `Strip()` (`--tokenizer`,
+`--config`, `--output`).
+
+**Frozen, not recomputed.** The per-layer hash multipliers come from numpy's PCG64
+seeded with `10007 * layer_id`; numpy does not promise stream stability across
+releases, and a different multiplier rehashes every row of a 94 GiB table. They
+are therefore generated once and pinned in the layout file (four odd int64 per
+layer, bounded so `token_id * multiplier` cannot overflow int64), together with
+the primes and the flat bucket offsets (`--layout`).
+
+### The addressing
+
+Per position, on the *compressed* ids: the `max_ngram_size - 1` previous tokens
+(start clamped to 0, any dead/image token blocking the n-gram) each get
+`token * multiplier` XOR-ed into a rolling value; after step `i` that value is the
+hash of the `(i+1)`-gram, taken `% prime` for each of the `n_heads` heads and
+shifted by the layer's flat offset. That is `(max_ngram_size - 1) x n_heads` = 24
+ids per position per layer, and the ids depend only on the token ids -- so they can
+be computed (and their table rows prefetched) for a whole prompt before any layer
+runs, unlike routed experts.
+
+### The forward (`ref:296-365`)
+
+1. `embed`: gather 24 rows of `head_dim` fp8 per position and dequantize with the
+   row's E8M0 scales, one per 32 columns (row = 256 bytes + 8 scale bytes), then
+   flatten to `24 * 256 = 6144`.
+2. `wkv`: one matmul `[24 * head_dim -> dim * (hc_mult + 1)]` -- the released
+   checkpoint stores it as fp8 `[25600, 6144]`, i.e. `5120 * 5 x 6144`, which is
+   how the shape was confirmed.
+3. split into `key` (`hc_mult x dim`) and `value` (`dim`); `weight` is
+   `q_weight * k_weight`, only ever used as a product.
+4. per (token, hc copy), `rstd = rsqrt(mean(h^2) + eps) * rsqrt(mean(key^2) + eps)`
+   and `dot = sum(h * weight * key) * rstd * dim^-0.5` -- normalized per copy, not
+   jointly.
+5. `gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot))`: a signed square root
+   before the sigmoid, matching the training kernel.
+6. `h + gate * value`, cast back to the stream's dtype. A token mask forces the
+   gate to 0, which is what makes an image span pass through untouched.
+
+Consequence for the port: the 94.4 GiB per layer is *gathered*, 24 rows per token,
+and the working set of an interactive session is a few tens of MB of rows -- so the
+tables are memory-mapped and left to the page cache, never loaded, never LRU-managed
+like the expert store. `wkv` and the rest of the path reuse the engine's existing
+fp8 machinery.
+
 ## Port plan
 
 1. `c/family_registry.py`: `deepseek_v41` descriptor + `_dsv41_geometry` planner. **done**
@@ -225,5 +285,7 @@ From the reference (`ref:500-580`, `ref:722-778`):
 - [x] Checkpoint contract verified from headers alone (96,085 tensors / 475.2 GiB,
       ownership sets, engram sizes) by `tools/check_deepseek_v41_checkpoint.py`
 - [ ] V4.1 config shape + fail-closed gates in the engine
-- [ ] Shared KV/index, engram, DSpark
+- [x] Engram layout verified against the checkpoint's own numbers (token map
+      classes, table rows) by `tools/make_deepseek_v41_engram.py`
+- [ ] Shared KV/index, engram path, DSpark
 - [ ] Tiny oracle 32/32
