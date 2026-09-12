@@ -36,10 +36,14 @@ output and read it instead -- the comparison is the same:
 Build the probe from c/ (the objects the engine's own test links):
 
     make -f Makefile.deepseek-v41 COLI_V41_UNIT_NATIVE_QUANT.o COLI_V41_UNIT_MATH.o \
-        COLI_V41_UNIT_BLOCK_HYBRID.o
+        COLI_V41_UNIT_BLOCK_HYBRID.o COLI_V41_UNIT_ENGRAM.o
     gcc -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -O2 -I. tests/v41_ops_probe.c \
         COLI_V41_UNIT_NATIVE_QUANT.o COLI_V41_UNIT_MATH.o COLI_V41_UNIT_BLOCK_HYBRID.o \
-        -o build/v41_ops_probe -lm -fopenmp -pthread
+        COLI_V41_UNIT_ENGRAM.o -o build/v41_ops_probe -lm -fopenmp -pthread
+
+(`COLI_V41_UNIT_ENGRAM.o` is in the list because that unit owns
+`coli_v41_fp8_matvec_blocked`, the dense matvec whose geometry comes from the view; the four
+objects are the ones the probe's calls resolve to, not a guess.)
 
 Two things that only show up off Windows: the engine's own flags force-include `pthread.h`
 (`-include pthread.h`, which is what declares `pthread_once` here), and the link needs `-flto`
@@ -222,6 +226,39 @@ def check_fp4_expert_matvec(record: dict, vendor: tuple | None) -> list[str]:
     return []
 
 
+def check_fp8_matvec_32(record: dict) -> list[str]:
+    """The dense path at the checkpoint's geometry, and the shared matvec's refusal of it.
+
+    The engine's new dense matvec takes the block geometry from the view (32x32 here); the
+    shared one is V4's 128-wide kernel and must say no rather than read the scales as if they
+    were 128 apart. Then the product itself: the engine quantizes the activation over the same
+    width the weight uses, which is what the reference's Linear does, so the checker quantizes
+    it the same way and compares the products.
+    """
+    rows, columns, block = record["rows"], record["columns"], record["block"]
+    problems = []
+    if record["shared"] == 0:
+        problems.append("the shared matvec accepted a view with 32x32 blocks")
+    if record["blocked"] != 0:
+        problems.append(f"the family matvec refused a 32x32 view (code {record['blocked']})")
+    codes = (_tensor(record["data"], dtype=torch.uint8).view(torch.float8_e4m3fn)
+             .float().reshape(rows, columns))
+    scales = _tensor(record["scales"]).reshape(rows // block, columns // block)
+    weights = codes * (scales.repeat_interleave(block, dim=0)
+                       .repeat_interleave(block, dim=1)[:rows, :columns])
+    x = _tensor(record["input"])
+    quantized, scale_bytes = ref.act_quant(x, block, scale_fmt="ue8m0",
+                                           scale_dtype=torch.float8_e8m0fnu)
+    activation = _dequantize_blocks(quantized.flatten(), scale_bytes.flatten(), block)
+    ours = weights @ activation
+    delta = _max_delta(ours, _tensor(record["output"]))
+    print(f"  fp8_matvec_32       {rows}x{columns} block {block}: shared refused ({record['shared']}), "
+          f"family accepted ({record['blocked']}), max |delta| {delta:.3e}")
+    if delta > 1e-3:
+        problems.append(f"the 32x32 matvec differs by {delta:.3e}")
+    return problems
+
+
 def check_hc(record: dict) -> list[str]:
     hc, count = record["hc"], record["count"]
     mix_hc = (2 + hc) * hc
@@ -280,6 +317,8 @@ def main() -> int:
             problems += check_fp8_act_qdq(record)
         elif op == "fp8_matvec_128":
             problems += check_fp8_matvec(record)
+        elif op == "fp8_matvec_32":
+            problems += check_fp8_matvec_32(record)
         elif op == "fp4_tables":
             problems += check_fp4_tables(record, vendor)
         elif op == "fp4_expert_matvec":

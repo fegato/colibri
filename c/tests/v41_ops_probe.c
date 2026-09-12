@@ -210,5 +210,44 @@ int main(void) {
         print_floats("e8m0", decoded, 8);
         printf("}\n");
     }
+    /* The dense path at the checkpoint's geometry: 32x32 scales consumed by the family
+     * matvec. The shared matvec is asked the same question and has to refuse it -- that
+     * refusal is what makes the dispatch load-bearing rather than decorative. */
+    {
+        enum { rows = 32, columns = 128, block = 32 };
+        static uint8_t data[rows * columns];
+        static float packed_scales[rows / block][columns / block] = {
+            {1.0f, 0.5f, 2.0f, 0.25f},
+        };
+        for (int index = 0; index < rows * columns; index++)
+            data[index] = (uint8_t)(0x30 + (index % 5));      /* e4m3 values near 1..3 */
+        ColiTensorView weight;
+        memset(&weight, 0, sizeof(weight));
+        weight.format = COLI_TENSOR_FP8_E4M3_BLOCK;
+        weight.scale_format = COLI_SCALE_F32;
+        weight.data = data;
+        weight.scales = packed_scales;
+        weight.data_bytes = sizeof(data);
+        weight.scale_bytes = sizeof(packed_scales);
+        weight.rows = rows;
+        weight.columns = columns;
+        weight.block_rows = block;
+        weight.block_columns = block;
+        float output[rows];
+        memset(output, 0, sizeof(output));
+        int shared = coli_fp8_matvec_ref(output, &weight, input);
+        memset(output, 0, sizeof(output));
+        int blocked = coli_v41_fp8_matvec_blocked(output, &weight, input);
+        printf("{\"op\":\"fp8_matvec_32\",\"rows\":%d,\"columns\":%d,\"block\":%d,"
+               "\"shared\":%d,\"blocked\":%d,", rows, columns, block, shared, blocked);
+        print_bytes("data", data, rows * columns);
+        printf(",");
+        print_floats("scales", &packed_scales[0][0], (rows / block) * (columns / block));
+        printf(",");
+        print_floats("input", input, columns);
+        printf(",");
+        print_floats("output", output, rows);
+        printf("}\n");
+    }
     return 0;
 }

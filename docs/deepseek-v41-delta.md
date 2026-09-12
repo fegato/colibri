@@ -506,24 +506,29 @@ computed product, plus the width and scale-size refusals). The dense layers stil
 need the same treatment, and that is the next thing that must land before the engine
 can run one V4.1 layer at all.
 
-### Where, exactly
+### Where, exactly (and what became of it)
 
-Grepped in `deepseek_v41.c` at `0c1b504`; the line numbers drift, so each site is named too --
-and every one of them has to be read before it is changed, because an amalgamated engine keeps
-per-unit copies of the same helper and a partial sweep reads as a complete one in a diff.
+The sweep landed in `c/deepseek_v41.c` at `bcff526`'s child; the counts below are what it touched,
+and the line numbers were read at `0c1b504` and drift.
 
 | what | where | count |
 | --- | --- | --- |
 | `packed_rows8 ? 8 : 128, 128` -- the per-unit builds of a view's block geometry | 2387, 2849, 3997, 4737, 6848, 7331 | 6 |
-| `fp8_view` -- the per-unit helpers that fill it in | 2369, 2831 | 2 |
-| the grouped `wo_a` view | 2650, 3057 (the grouped matvec's GPU branch, compiled out here: the row grouping itself is what has to take the new width) | 2 |
+| `fp8_view` -- the per-unit helpers that fill it in (three, not two: the first count came from a truncated grep) | 2369, 2831, 7313 | 3 |
+| the grouped `wo_a` view -- both the scale geometry *and* the per-group scale offsets were at 128 | 2646, 3053, 7535 | 3 |
 | `v41_fp8_pack_rows8_inplace` -- V4's runtime packing, which *redefines* `block_rows` to 8 to describe its own on-disk form | 794 | 1 |
-| `coli_v41_fp8_matvec_blocked` -- the family-local matvec that already takes the geometry from the view | 1930 | the dispatch target |
+| the shared activation buffer (`input_act`) that fed wq_a and wkv at 128 | 2449, 2911, 7398 | 3 |
+| the shared matvec calls in the dense path (attention projections, grouped wo_a, indexer query projection, shared experts) | 12 + 3 + 3 + 6 | 24 |
+| `coli_v41_fp8_matvec_blocked` -- the family matvec that takes the geometry from the view | 1930 | the dispatch target |
 
-Two rules turn those six edits into one sweep: the packing flag is off for V4.1 (leaving it on
-tells the view a geometry the checkpoint does not have), and every site has to reach
-`coli_v41_fp8_matvec_blocked` -- a site left on the shared matvec keeps V4's 128 and says
-nothing.
+Two rules made those edits one sweep rather than six: the packing flag is now off for V4.1 (it
+describes V4's own on-disk form, and leaving it on would tell the view a geometry the checkpoint
+does not have), and every site reaches `coli_v41_fp8_matvec_blocked` -- a site left on the shared
+matvec keeps V4's 128 and says nothing. The shared matvec now *refuses* a 32-wide view
+(`fp8_matvec_validate` demands `block_columns == 128`), which is what turns a partial sweep into a
+loud failure instead of a quiet one: the probe asks both matvecs the same question and records
+`shared refused (-1), family accepted (0)`, with the family product agreeing with torch to
+`0.000e+00`.
 
 ### The table is mapped, never read, and the driver stays per position
 
@@ -587,8 +592,11 @@ leave different residuals.
 - [x] V4.1 config shape + fail-closed gates in the engine
 - [x] Engram table mapped out of the shard (no copy, E8M0 scales kept raw)
 - [x] Engram per-position driver + workspace, fail-closed on every shape
-- [ ] Dense fp8 block geometry: the engine hardcodes 128-wide blocks, the
-      checkpoint is 32 -- blocks any V4.1 layer
+- [x]  Dense fp8 block geometry: the views take the width from the checkpoint's scale shape, V4's
+      rows8 packing is off, and every dense site -- the attention projections, the grouped `wo_a`,
+      the indexer's query projection, the shared experts -- dispatches to
+      `coli_v41_fp8_matvec_blocked`. The shared matvec refuses a 32-wide view instead of reading
+      it as 128, and the path is pinned against torch (32x128, delta `0.000e+00`)
 - [x] Verified on Linux as well as Windows: from a clean clone of the pushed commit,
       on gcc 15.2 / Ubuntu 26.04, the engine builds (0 errors), the contract test
       passes 110/110 checks with 0 warnings of its own, the registry test passes

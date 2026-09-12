@@ -875,17 +875,12 @@ int coli_v41_layer_load(ColiV41Engine *engine,
             coli_v41_layer_free(NULL, weights);
             return set_error(error, error_size, "cannot read tensor: %s", spec->name);
         }
-        if (spec->dtype == COLI_ST_F8_E4M3 && spec->rank == 2) {
-            int packed = v41_fp8_pack_rows8_inplace(
-                weights->data[i], spec->shape[0], spec->shape[1]);
-            if (packed < 0) {
-                coli_v41_layer_free(NULL, weights);
-                return set_error(error, error_size,
-                                 "out of memory packing FP8 rows8: %s",
-                                 spec->name);
-            }
-            weights->plan.tensors[i].packed_rows8 = packed > 0;
-        }
+        /* V4's rows8 packing is deliberately not applied. It interleaves the rows into
+         * an AVX2 tile and then *reports* the geometry as block_rows 8, which is how
+         * V4's shared matvec recognises its own layout; V4.1's dense matvec takes the
+         * geometry from the view instead (32x32 scales, docs/deepseek-v41-delta.md), so
+         * packing here would describe a row layout no V4.1 matvec reads. The helper and
+         * the flag stay for the engines that use them. */
     }
     return 0;
 }
@@ -2377,14 +2372,26 @@ static int fp8_view(ColiTensorView *view,
     const void *scales = layer_data(weights, suffix, &scale_spec);
     if (!data || !scales || !weight_spec || !scale_spec ||
         weight_spec->dtype != COLI_ST_F8_E4M3 ||
-        scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2)
+        scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2 ||
+        scale_spec->rank != 2 || scale_spec->shape[0] < 1 ||
+        scale_spec->shape[1] < 1 ||
+        weight_spec->shape[0] % scale_spec->shape[0] ||
+        weight_spec->shape[1] % scale_spec->shape[1])
         return -1;
+    /* The block geometry is the checkpoint's, not this engine's: the scale tensor is
+     * [rows / block_rows, columns / block_columns] by construction, so the view is told
+     * the width the weight was stored with. V4.1 stores every dense weight with 32x32
+     * scales; V4's 128 here dequantized each of them with the wrong row of scales
+     * (docs/deepseek-v41-delta.md). A scale that does not tile its weight is refused
+     * here, and the shared matvec refuses this width too rather than reading it as
+     * 128 -- the dispatch below is what accepts it. */
     *view = (ColiTensorView){
         COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32, data, scales,
         (size_t)(weight_spec->shape[0] * weight_spec->shape[1]),
         (size_t)(scale_spec->shape[0] * scale_spec->shape[1]) * sizeof(float),
         weight_spec->shape[0], weight_spec->shape[1],
-        weight_spec->packed_rows8 ? 8 : 128, 128,
+        weight_spec->shape[0] / scale_spec->shape[0],
+        weight_spec->shape[1] / scale_spec->shape[1],
         coli_v41_layer_gpu(weights, prefix)
     };
     return 0;
@@ -2442,16 +2449,11 @@ static int attention_token_impl(float *output,
         return set_error(error, error_size, "out of memory in attention");
     }
 
-    /* wq_a e wkv consumano lo stesso input: qdq UNA volta e riuso via _pre
-     * (il dedup rinviato da #1076). Bit-identico: stessi byte qdq, stesso
-     * compute, GPU path invariato (riceve l'input raw come prima).
-     * EN: wq_a and wkv consume the same input — qdq once, reuse via _pre. */
-    float *input_act = malloc((size_t)wq_a.columns * sizeof(*input_act));
-    uint8_t *input_act_scales = malloc((size_t)wq_a.columns / 128 + 1);
-    int result = (!input_act || !input_act_scales ||
-                  coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
-                                              (size_t)wq_a.columns, 128)) ? -1 : 0;
-    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
+    /* wq_a and wkv do read the same input, but the reference quantizes the input of
+     * *each* Linear on its own -- and over the block width the checkpoint declares,
+     * which the view carries (V4.1: 32, not V4's 128). So the family matvec quantizes
+     * for itself instead of sharing one 128-wide activation. */
+    int result = coli_v41_fp8_matvec_blocked(qa, &wq_a, input);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -2491,7 +2493,7 @@ static int attention_token_impl(float *output,
             if (compressed_selected < 0) result = -1;
         }
     }
-    if (!result) result = coli_fp8_matvec_ref(q, &wq_b, qa);
+    if (!result) result = coli_v41_fp8_matvec_blocked(q, &wq_b, qa);
     if (!result) coli_bf16_round_array(q, (size_t)heads * head_dim);
     for (int head = 0; !result && head < heads; head++) {
         float *values = q + (size_t)head * head_dim;
@@ -2501,7 +2503,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
+    if (!result) result = coli_v41_fp8_matvec_blocked(kv, &wkv, input);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -2642,8 +2644,14 @@ static int attention_token_impl(float *output,
 
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
-    int scale_columns = (group_width + 127) / 128;
-    int scale_rows_per_group = (o_rank + 127) / 128;
+    int block_columns = (int)wo_a.block_columns;
+    int block_rows = (int)wo_a.block_rows;
+    int scale_columns = group_width / block_columns;
+    int scale_rows_per_group = o_rank / block_rows;
+    /* a group's rows start on a multiple of o_rank, which has to tile the scale's row
+     * block for the group view to describe the same weights the checkpoint stores */
+    if (group_width % block_columns || o_rank % block_rows)
+        result = -1;
     if (!result) {
 #ifdef COLI_V4_GPU_TIER
         if (wo_a.gpu) {
@@ -2661,18 +2669,18 @@ static int attention_token_impl(float *output,
             group_view.data_bytes = (size_t)o_rank * group_width;
             group_view.scale_bytes =
                 (size_t)scale_rows_per_group * scale_columns * sizeof(float);
-            result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
-                                         attended + (size_t)group * group_width);
+            result = coli_v41_fp8_matvec_blocked(oa + (size_t)group * o_rank,
+                                                 &group_view,
+                                                 attended + (size_t)group * group_width);
         }
     }
     if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
-    if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result) result = coli_v41_fp8_matvec_blocked(output, &wo_b, oa);
     if (!result) coli_bf16_round_array(output, (size_t)hidden);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
-    free(input_act_scales); free(input_act);
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -2839,14 +2847,26 @@ static int fp8_view(ColiTensorView *view,
     const void *scales = layer_data(weights, suffix, &scale_spec);
     if (!data || !scales || !weight_spec || !scale_spec ||
         weight_spec->dtype != COLI_ST_F8_E4M3 ||
-        scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2)
+        scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2 ||
+        scale_spec->rank != 2 || scale_spec->shape[0] < 1 ||
+        scale_spec->shape[1] < 1 ||
+        weight_spec->shape[0] % scale_spec->shape[0] ||
+        weight_spec->shape[1] % scale_spec->shape[1])
         return -1;
+    /* The block geometry is the checkpoint's, not this engine's: the scale tensor is
+     * [rows / block_rows, columns / block_columns] by construction, so the view is told
+     * the width the weight was stored with. V4.1 stores every dense weight with 32x32
+     * scales; V4's 128 here dequantized each of them with the wrong row of scales
+     * (docs/deepseek-v41-delta.md). A scale that does not tile its weight is refused
+     * here, and the shared matvec refuses this width too rather than reading it as
+     * 128 -- the dispatch below is what accepts it. */
     *view = (ColiTensorView){
         COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32, data, scales,
         (size_t)(weight_spec->shape[0] * weight_spec->shape[1]),
         (size_t)(scale_spec->shape[0] * scale_spec->shape[1]) * sizeof(float),
         weight_spec->shape[0], weight_spec->shape[1],
-        weight_spec->packed_rows8 ? 8 : 128, 128,
+        weight_spec->shape[0] / scale_spec->shape[0],
+        weight_spec->shape[1] / scale_spec->shape[1],
         coli_v41_layer_gpu(weights, prefix)
     };
     return 0;
@@ -2904,16 +2924,11 @@ static int attention_token_impl(float *output,
         return set_error(error, error_size, "out of memory in attention");
     }
 
-    /* wq_a e wkv consumano lo stesso input: qdq UNA volta e riuso via _pre
-     * (il dedup rinviato da #1076). Bit-identico: stessi byte qdq, stesso
-     * compute, GPU path invariato (riceve l'input raw come prima).
-     * EN: wq_a and wkv consume the same input — qdq once, reuse via _pre. */
-    float *input_act = malloc((size_t)wq_a.columns * sizeof(*input_act));
-    uint8_t *input_act_scales = malloc((size_t)wq_a.columns / 128 + 1);
-    int result = (!input_act || !input_act_scales ||
-                  coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
-                                              (size_t)wq_a.columns, 128)) ? -1 : 0;
-    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
+    /* wq_a and wkv do read the same input, but the reference quantizes the input of
+     * *each* Linear on its own -- and over the block width the checkpoint declares,
+     * which the view carries (V4.1: 32, not V4's 128). So the family matvec quantizes
+     * for itself instead of sharing one 128-wide activation. */
+    int result = coli_v41_fp8_matvec_blocked(qa, &wq_a, input);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -2941,7 +2956,7 @@ static int attention_token_impl(float *output,
             if (compressed_selected < 0) result = -1;
         }
     }
-    if (!result) result = coli_fp8_matvec_ref(q, &wq_b, qa);
+    if (!result) result = coli_v41_fp8_matvec_blocked(q, &wq_b, qa);
     if (!result) coli_bf16_round_array(q, (size_t)heads * head_dim);
     for (int head = 0; !result && head < heads; head++) {
         float *values = q + (size_t)head * head_dim;
@@ -2951,7 +2966,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
+    if (!result) result = coli_v41_fp8_matvec_blocked(kv, &wkv, input);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -3049,8 +3064,14 @@ static int attention_token_impl(float *output,
 
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
-    int scale_columns = (group_width + 127) / 128;
-    int scale_rows_per_group = (o_rank + 127) / 128;
+    int block_columns = (int)wo_a.block_columns;
+    int block_rows = (int)wo_a.block_rows;
+    int scale_columns = group_width / block_columns;
+    int scale_rows_per_group = o_rank / block_rows;
+    /* a group's rows start on a multiple of o_rank, which has to tile the scale's row
+     * block for the group view to describe the same weights the checkpoint stores */
+    if (group_width % block_columns || o_rank % block_rows)
+        result = -1;
     if (!result) {
 #ifdef COLI_V4_GPU_TIER
         if (wo_a.gpu) {
@@ -3068,18 +3089,18 @@ static int attention_token_impl(float *output,
             group_view.data_bytes = (size_t)o_rank * group_width;
             group_view.scale_bytes =
                 (size_t)scale_rows_per_group * scale_columns * sizeof(float);
-            result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
-                                         attended + (size_t)group * group_width);
+            result = coli_v41_fp8_matvec_blocked(oa + (size_t)group * o_rank,
+                                                 &group_view,
+                                                 attended + (size_t)group * group_width);
         }
     }
     if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
-    if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result) result = coli_v41_fp8_matvec_blocked(output, &wo_b, oa);
     if (!result) coli_bf16_round_array(output, (size_t)hidden);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
-    free(input_act_scales); free(input_act);
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -4350,8 +4371,8 @@ int coli_v41_indexer_select_batch(ColiDeepSeekV41Indexer *state, int *indices,
             long long bad = 0; double worst = 0.0;
             for (int t = 0; ref && t < batch; t++) {
                 if (selected[t] >= 0) continue;
-                if (coli_fp8_matvec_ref(ref, &wq,
-                                        query_ranks + (size_t)t * wq.columns)) break;
+                if (coli_v41_fp8_matvec_blocked(
+                        ref, &wq, query_ranks + (size_t)t * wq.columns)) break;
                 for (size_t i = 0; i < qn; i++) {
                     float got = queries[(size_t)t * qn + i];
                     double diff = fabs((double)got - ref[i]);
@@ -4367,8 +4388,9 @@ int coli_v41_indexer_select_batch(ColiDeepSeekV41Indexer *state, int *indices,
     if (!result && !projected)
         for (int t = 0; !result && t < batch; t++)
             if (selected[t] < 0 &&
-                coli_fp8_matvec_ref(queries + (size_t)t * qn, &wq,
-                                    query_ranks + (size_t)t * wq.columns))
+                coli_v41_fp8_matvec_blocked(
+                    queries + (size_t)t * qn, &wq,
+                    query_ranks + (size_t)t * wq.columns))
                 result = set_error(error, error_size,
                                    "indexer query projection failed");
     IDX_PROF_MARK(t_proj);
@@ -4531,7 +4553,7 @@ static int indexer_step_common(ColiDeepSeekV41Indexer *state, int *indices,
         free(qdq); free(scales); free(scores); free(head_weights); free(queries);
         return set_error(error, error_size, "out of memory scoring indexer");
     }
-    int result = coli_fp8_matvec_ref(queries, &wq, query_rank);
+    int result = coli_v41_fp8_matvec_blocked(queries, &wq, query_rank);
     if (!result) coli_bf16_round_array(queries, (size_t)heads * dimension);
     if (!result) result = apply_position_rope(queries, state->config, position);
     for (int head = 0; !result && head < heads; head++) {
@@ -7000,7 +7022,7 @@ static int indexer_step_common(ColiDeepSeekV41Indexer *state, int *indices,
         free(qdq); free(scales); free(scores); free(head_weights); free(queries);
         return set_error(error, error_size, "out of memory scoring indexer");
     }
-    int result = coli_fp8_matvec_ref(queries, &wq, query_rank);
+    int result = coli_v41_fp8_matvec_blocked(queries, &wq, query_rank);
     if (!result) coli_bf16_round_array(queries, (size_t)heads * dimension);
     if (!result) result = apply_position_rope(queries, state->config, position);
     for (int head = 0; !result && head < heads; head++) {
@@ -7321,14 +7343,26 @@ static int fp8_view(ColiTensorView *view,
     const void *scales = layer_data(weights, suffix, &scale_spec);
     if (!data || !scales || !weight_spec || !scale_spec ||
         weight_spec->dtype != COLI_ST_F8_E4M3 ||
-        scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2)
+        scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2 ||
+        scale_spec->rank != 2 || scale_spec->shape[0] < 1 ||
+        scale_spec->shape[1] < 1 ||
+        weight_spec->shape[0] % scale_spec->shape[0] ||
+        weight_spec->shape[1] % scale_spec->shape[1])
         return -1;
+    /* The block geometry is the checkpoint's, not this engine's: the scale tensor is
+     * [rows / block_rows, columns / block_columns] by construction, so the view is told
+     * the width the weight was stored with. V4.1 stores every dense weight with 32x32
+     * scales; V4's 128 here dequantized each of them with the wrong row of scales
+     * (docs/deepseek-v41-delta.md). A scale that does not tile its weight is refused
+     * here, and the shared matvec refuses this width too rather than reading it as
+     * 128 -- the dispatch below is what accepts it. */
     *view = (ColiTensorView){
         COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32, data, scales,
         (size_t)(weight_spec->shape[0] * weight_spec->shape[1]),
         (size_t)(scale_spec->shape[0] * scale_spec->shape[1]) * sizeof(float),
         weight_spec->shape[0], weight_spec->shape[1],
-        weight_spec->packed_rows8 ? 8 : 128, 128,
+        weight_spec->shape[0] / scale_spec->shape[0],
+        weight_spec->shape[1] / scale_spec->shape[1],
         coli_v41_layer_gpu(weights, prefix)
     };
     return 0;
@@ -7386,16 +7420,11 @@ static int attention_token_impl(float *output,
         return set_error(error, error_size, "out of memory in attention");
     }
 
-    /* wq_a e wkv consumano lo stesso input: qdq UNA volta e riuso via _pre
-     * (il dedup rinviato da #1076). Bit-identico: stessi byte qdq, stesso
-     * compute, GPU path invariato (riceve l'input raw come prima).
-     * EN: wq_a and wkv consume the same input — qdq once, reuse via _pre. */
-    float *input_act = malloc((size_t)wq_a.columns * sizeof(*input_act));
-    uint8_t *input_act_scales = malloc((size_t)wq_a.columns / 128 + 1);
-    int result = (!input_act || !input_act_scales ||
-                  coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
-                                              (size_t)wq_a.columns, 128)) ? -1 : 0;
-    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
+    /* wq_a and wkv do read the same input, but the reference quantizes the input of
+     * *each* Linear on its own -- and over the block width the checkpoint declares,
+     * which the view carries (V4.1: 32, not V4's 128). So the family matvec quantizes
+     * for itself instead of sharing one 128-wide activation. */
+    int result = coli_v41_fp8_matvec_blocked(qa, &wq_a, input);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -7423,7 +7452,7 @@ static int attention_token_impl(float *output,
             if (compressed_selected < 0) result = -1;
         }
     }
-    if (!result) result = coli_fp8_matvec_ref(q, &wq_b, qa);
+    if (!result) result = coli_v41_fp8_matvec_blocked(q, &wq_b, qa);
     if (!result) coli_bf16_round_array(q, (size_t)heads * head_dim);
     for (int head = 0; !result && head < heads; head++) {
         float *values = q + (size_t)head * head_dim;
@@ -7433,7 +7462,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
+    if (!result) result = coli_v41_fp8_matvec_blocked(kv, &wkv, input);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -7531,8 +7560,14 @@ static int attention_token_impl(float *output,
 
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
-    int scale_columns = (group_width + 127) / 128;
-    int scale_rows_per_group = (o_rank + 127) / 128;
+    int block_columns = (int)wo_a.block_columns;
+    int block_rows = (int)wo_a.block_rows;
+    int scale_columns = group_width / block_columns;
+    int scale_rows_per_group = o_rank / block_rows;
+    /* a group's rows start on a multiple of o_rank, which has to tile the scale's row
+     * block for the group view to describe the same weights the checkpoint stores */
+    if (group_width % block_columns || o_rank % block_rows)
+        result = -1;
     if (!result) {
 #ifdef COLI_V4_GPU_TIER
         if (wo_a.gpu) {
@@ -7550,18 +7585,18 @@ static int attention_token_impl(float *output,
             group_view.data_bytes = (size_t)o_rank * group_width;
             group_view.scale_bytes =
                 (size_t)scale_rows_per_group * scale_columns * sizeof(float);
-            result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
-                                         attended + (size_t)group * group_width);
+            result = coli_v41_fp8_matvec_blocked(oa + (size_t)group * o_rank,
+                                                 &group_view,
+                                                 attended + (size_t)group * group_width);
         }
     }
     if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
-    if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result) result = coli_v41_fp8_matvec_blocked(output, &wo_b, oa);
     if (!result) coli_bf16_round_array(output, (size_t)hidden);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
-    free(input_act_scales); free(input_act);
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -9565,8 +9600,10 @@ int coli_v41_shared_expert_forward_ref(float *output,
     if (!gate || !up || !activated) {
         free(activated); free(up); free(gate); return -1;
     }
-    int result = coli_fp8_dual_matvec_ref(
-        gate, up, gate_weight, up_weight, input);
+    /* the shared dual matvec is V4's 128-wide kernel: the reference quantizes the
+     * input of each Linear on its own, so two family matvecs are the same numbers */
+    int result = coli_v41_fp8_matvec_blocked(gate, gate_weight, input) ||
+                 coli_v41_fp8_matvec_blocked(up, up_weight, input);
     if (!result) {
         coli_bf16_round_array(gate, intermediate);
         coli_bf16_round_array(up, intermediate);
@@ -9575,7 +9612,7 @@ int coli_v41_shared_expert_forward_ref(float *output,
     }
     if (!result) {
         coli_bf16_round_array(activated, intermediate);
-        result = coli_fp8_matvec_ref(output, down_weight, activated);
+        result = coli_v41_fp8_matvec_blocked(output, down_weight, activated);
     }
     if (!result) coli_bf16_round_array(output, output_size);
     free(activated); free(up); free(gate);
@@ -15243,8 +15280,8 @@ int coli_v41_shared_expert_forward_ref(float *output,
         free(activated); free(up); free(gate);
         return -1;
     }
-    int result = coli_fp8_matvec_ref(gate, gate_weight, input) ||
-                 coli_fp8_matvec_ref(up, up_weight, input);
+    int result = coli_v41_fp8_matvec_blocked(gate, gate_weight, input) ||
+                 coli_v41_fp8_matvec_blocked(up, up_weight, input);
     if (!result) {
         coli_bf16_round_array(gate, intermediate);
         coli_bf16_round_array(up, intermediate);
@@ -15253,7 +15290,7 @@ int coli_v41_shared_expert_forward_ref(float *output,
     }
     if (!result) {
         coli_bf16_round_array(activated, intermediate);
-        result = coli_fp8_matvec_ref(output, down_weight, activated);
+        result = coli_v41_fp8_matvec_blocked(output, down_weight, activated);
     }
     if (!result) coli_bf16_round_array(output, output_size);
     free(activated); free(up); free(gate);
