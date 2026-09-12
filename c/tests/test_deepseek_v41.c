@@ -26,6 +26,7 @@
 #include "deepseek_v41_internal.h"
 #include "deepseek_v41_engram_tables.h"
 #include "deepseek_v41_engram_vectors.h"
+#include "deepseek_v41_engram_map_checks.h"
 
 /* A compact but *structurally complete* V4.1 config: the real checkpoint's keys,
  * shrunk to four backbone layers plus one DSpark stage. */
@@ -298,6 +299,41 @@ static void test_engram_hash(void) {
     check(failures == failures_before, "every engram vector matched");
 }
 
+
+/* Rebuilding the token map from the packed header, against the reference's map.
+ * The fingerprint covers all 129,280 entries in one number; the samples make a
+ * failure readable. */
+static void test_engram_token_map(void) {
+    uint32_t *map = malloc(COLI_V41_ENGRAM_MAP_TOKEN_COUNT * sizeof(*map));
+    assert(map != NULL);
+    int classes = coli_v41_engram_build_token_map(map, COLI_V41_ENGRAM_MAP_TOKEN_COUNT);
+    check(classes == COLI_V41_ENGRAM_MAP_CLASS_COUNT,
+          "the rebuilt map has the reference's class count");
+    for (int index = 0; index < coli_v41_engram_map_sample_count; index++) {
+        const ColiV41EngramMapSample *sample = &coli_v41_engram_map_samples[index];
+        if (map[sample->token_id] != sample->class_id) {
+            printf("      token %d: %u, expected %u\n", sample->token_id,
+                   map[sample->token_id], sample->class_id);
+            check(0, "token map samples match");
+            free(map);
+            return;
+        }
+    }
+    check(1, "token map samples match the reference");
+    check(coli_v41_engram_token_map_digest(map, COLI_V41_ENGRAM_MAP_TOKEN_COUNT) ==
+          coli_v41_engram_map_expected_fnv1a64,
+          "the rebuilt map matches the reference byte for byte (FNV-1a)");
+    /* classes are dense because they are handed out in order */
+    uint32_t highest = 0;
+    for (int token = 0; token < COLI_V41_ENGRAM_MAP_TOKEN_COUNT; token++)
+        if (map[token] > highest) highest = map[token];
+    check((int)highest + 1 == classes, "classes are dense 0..count-1");
+    /* a caller with too little room is refused, not half-filled */
+    check(coli_v41_engram_build_token_map(map, 16) != 0,
+          "rebuilding into a too-small map is refused");
+    free(map);
+}
+
 /* The class lookup and its fail-closed edges. */
 static void test_engram_compress(void) {
     const uint32_t map[8] = {0, 1, 2, 2, 3, 4, 4, 5};
@@ -332,6 +368,7 @@ int main(void) {
     test_source_table_validation();
     test_router();
     test_swiglu_clamp();
+    test_engram_token_map();
     test_engram_hash();
     test_engram_compress();
     if (failures) {

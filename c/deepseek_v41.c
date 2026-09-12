@@ -1748,10 +1748,70 @@ int coli_v41_swiglu(float *output, const float *gate, const float *up,
  * weights. See docs/deepseek-v41-delta.md.
  * ------------------------------------------------------------------------- */
 #include "deepseek_v41_engram_tables.h"
+#include "deepseek_v41_engram_tokens.h"
 
 /* A position that takes no part in an n-gram (an image span), like the reference's
  * NgramHashState.DEAD. */
 #define COLI_V41_ENGRAM_DEAD (-1)
+
+/* One 17-bit representative out of the packed payload, bits MSB-first like the
+ * bytes the generator wrote. */
+static uint32_t v41_engram_repeat_rep(int repeat) {
+    uint32_t value = 0;
+    for (int bit = 0; bit < 17; bit++) {
+        size_t position = (size_t)repeat * 17 + (size_t)bit;
+        unsigned char byte = coli_v41_engram_repeat_reps[position >> 3];
+        value = (value << 1) | (uint32_t)((byte >> (7 - (position & 7))) & 1u);
+    }
+    return value;
+}
+
+/* Rebuild the token -> class map from the packed header. `map` must hold
+ * COLI_V41_ENGRAM_TOKEN_COUNT entries.
+ *
+ * The packed form relies on two properties of the way the reference numbers the
+ * classes: they are handed out in token-id order, and a repeat always names an
+ * *earlier* id. Both are checked here rather than trusted -- a payload that
+ * disagrees with itself must fail, because every byte of this map decides which
+ * row of a 94 GiB table a token hashes to.
+ *
+ * Returns the number of classes, or -1. */
+int coli_v41_engram_build_token_map(uint32_t *map, int map_count) {
+    if (!map || map_count < COLI_V41_ENGRAM_TOKEN_COUNT)
+        return -1;
+    int repeats = 0;
+    uint32_t next_class = 0;
+    for (int token_id = 0; token_id < COLI_V41_ENGRAM_TOKEN_COUNT; token_id++) {
+        unsigned char byte = coli_v41_engram_first_bitmap[token_id >> 3];
+        if (((byte >> (7 - (token_id & 7))) & 1u) != 0) {
+            map[token_id] = next_class++;
+            continue;
+        }
+        if (repeats >= COLI_V41_ENGRAM_REPEAT_COUNT)
+            return -1;
+        int representative = (int)v41_engram_repeat_rep(repeats++);
+        if (representative < 0 || representative >= token_id)
+            return -1;
+        map[token_id] = map[representative];
+    }
+    if (repeats != COLI_V41_ENGRAM_REPEAT_COUNT)
+        return -1;
+    return (int)next_class;
+}
+
+/* FNV-1a over the little-endian bytes of every class, in id order: the fingerprint
+ * the generator computed over the reference map. */
+uint64_t coli_v41_engram_token_map_digest(const uint32_t *map, int count) {
+    uint64_t digest = UINT64_C(0xcbf29ce484222325);
+    for (int index = 0; index < count; index++) {
+        uint32_t value = map[index];
+        for (int byte = 0; byte < 4; byte++) {
+            digest ^= (uint64_t)((value >> (byte * 8)) & 0xFFu);
+            digest *= UINT64_C(0x100000001b3);
+        }
+    }
+    return digest;
+}
 
 int coli_v41_engram_layer_position(int layer_id) {
     for (int position = 0; position < COLI_V41_ENGRAM_LAYERS; position++)

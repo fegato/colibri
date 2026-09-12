@@ -98,6 +98,23 @@ def main() -> int:
         return 1
 
     reference_map = state.token_map.tolist()
+    # The reference built its own map; compare it with ours entry by entry, so the
+    # map the C side ships is the reference's map and not merely a plausible one.
+
+    tokens_json = json.loads(Path('C:/Users/david/v41_engram_tokens.json')
+                             .read_text(encoding='utf-8'))
+    my_map = tokens_json['lookup']
+    if len(my_map) != len(reference_map):
+        print(f"MISMATCH: map length {len(my_map)} vs {len(reference_map)}")
+        return 1
+    differences = [index for index in range(len(my_map))
+                   if my_map[index] != reference_map[index]]
+    print(f"token map entries compared: {len(my_map)}, differing: {len(differences)}")
+    if differences:
+        print(f"  first difference at id {differences[0]}: "
+              f"{my_map[differences[0]]} vs {reference_map[differences[0]]}")
+        return 1
+    print("reference parity OK: the token map is identical, entry by entry")
 
     sequences = {
         'ascii': list(range(0, 16)),

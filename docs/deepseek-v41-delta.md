@@ -273,6 +273,38 @@ tables are memory-mapped and left to the page cache, never loaded, never LRU-man
 like the expert store. `wkv` and the rest of the path reuse the engine's existing
 fp8 machinery.
 
+### Where the token map lives (decided with measurements)
+
+The engine needs the 129,280-entry id -> class map at load. Measured on the real
+map (99,092 classes, 30,188 repeats):
+
+| encoding | bytes | as C source |
+| --- | --- | --- |
+| raw uint32 | 517,120 | ~2.5 MB |
+| 17-bit packed | 274,720 | ~1.3 MB |
+| varint deltas | 223,635 | ~1.1 MB |
+| **bitmap of first appearances + 17-bit representative per repeat** | **80,310** | **503 KB** |
+| (zlib floor on any of the above) | ~77,000 | – |
+
+Classes are handed out in token-id order and a repeat always names an *earlier*
+id, so the map is fully described by which ids are first appearances plus, for
+every other id, which earlier id it repeats. That is what the generated
+`deepseek_v41_engram_tokens.h` carries, and it is what the engine rebuilds.
+
+Committed as a generated header rather than a runtime file, so the engine still
+needs nothing but the checkpoint: `qwen38_nfc_tables.h` already ships 673 KB of
+generated table in this tree, so 503 KB is within the established shape, and no
+user has to run a tool before running a model. Regeneration is two commands, both
+recorded at the top of the header.
+
+### What the rebuild guarantees
+
+| check | result |
+| --- | --- |
+| our map vs the reference's own map, entry by entry | 129,280 compared, **0 differing** |
+| the C rebuild's class count, samples and FNV-1a fingerprint | match (64 checks in `tests/test_deepseek_v41.c`) |
+| a payload that disagrees with itself (repeat before its representative, too-small buffer) | refused, not guessed |
+
 ## Port plan
 
 1. `c/family_registry.py`: `deepseek_v41` descriptor + `_dsv41_geometry` planner. **done**
@@ -307,5 +339,7 @@ fp8 machinery.
       classes, table rows) by `tools/make_deepseek_v41_engram.py`
 - [x] Engram hash addressing implemented in C and pinned to the *official*
       implementation (prefill and decode), `COLI_V41_UNIT_ENGRAM`
+- [x] Token map storage decided by measurement and rebuilt in C, byte-identical to
+      the reference's map
 - [ ] Shared KV/index, engram path, DSpark
 - [ ] Tiny oracle 32/32

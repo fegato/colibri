@@ -171,6 +171,8 @@ int coli_v41_rope_apply(float *vectors, int vector_count, int dimension,
  * so this is the derived part: token id -> compressed class, and the n-gram hash
  * ids that index a layer's table. Pinned to the reference by
  * tests/deepseek_v41_engram_vectors.h. */
+int coli_v41_engram_build_token_map(uint32_t *map, int map_count);
+uint64_t coli_v41_engram_token_map_digest(const uint32_t *map, int count);
 int coli_v41_engram_layer_position(int layer_id);
 int coli_v41_engram_compress(int *classes, const int *ids, int count,
                              const uint32_t *token_map, int map_count, int dead);
