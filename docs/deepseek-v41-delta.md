@@ -74,7 +74,13 @@ arch `DeepseekV41ForCausalLM`) vs `deepseek-ai/DeepSeek-V4-Flash-0731`
 - [x] Branch `deepseek-v41` created, upstream v1.10.2
 - [x] V4.1 config captured (`model_type: deepseek_v41`)
 - [x] Delta analysis (this file)
-- [ ] Registry descriptor
-- [ ] Converter / native-load mapping
+- [x] Tensor inventory from official safetensors index (96,085 tensors)
+- [x] Native-load verdict: NO converter needed (same layout family as V4:
+  fp4 experts + scales, fp8 dense). New names vs the V4 engine: `engram.*`,
+  `markov_head.*`, `main_proj`/`main_norm`, `confidence_head`, `aligner`,
+  `image_*`, `ffn.gate.bias_vl`, `attn.indexer.wk`. Everything else matches
+  the `deepseek_v4.c` loader conventions (`attn.wq_a/wq_b/wkv/wo_a/wo_b`,
+  `compressor.*`, `ffn.gate`, shared experts, `hc_*`).
+- [x] Registry descriptor
 - [ ] Engine fork
 - [ ] Tiny oracle + validation
