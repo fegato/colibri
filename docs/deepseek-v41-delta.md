@@ -207,7 +207,25 @@ no weights involved, and both pass:
 | prime bucket layout | the 24 moduli of a layer sum to that layer's declared table rows | **384,006,168** and **384,016,682** = `engram_num_embeddings` |
 
 A wrong normalizer chain or a wrong prime-drawing order would miss those by a
-wide margin, so both reconstructions are pinned to the reference. The map is
+wide margin, so both reconstructions are pinned to the reference.
+
+**And then to the reference code itself.** Golden vectors produced by our own
+transcription only prove the C agrees with the transcription: if the transcription
+misreads the reference, both agree and both are wrong. So the C unit is held to the
+*official* engram implementation instead
+(`tools/check_deepseek_v41_engram_reference.py`, which runs `engram.py` under
+torch):
+
+| check | result |
+| --- | --- |
+| the reference builds its own compressed map and asserts its class count | passes (99,092) |
+| primes / bucket offsets it derives internally | identical |
+| multipliers from its own PCG64 seeding | identical |
+| hash ids, prefill path, every sequence | match |
+| hash ids, decode path (a single token against a filled cache) | match |
+
+The addressing is therefore pinned end to end -- reference implementation, our
+reconstruction, and the C unit -- before any weight is read. The map is
 built with the checkpoint's own tokenizer (129,280 ids) over the normalizer chain
 NFKC -> NFD -> strip accents -> lowercase -> collapse whitespace, with a
 private-use sentinel so a one-space token survives `Strip()` (`--tokenizer`,
@@ -287,5 +305,7 @@ fp8 machinery.
 - [ ] V4.1 config shape + fail-closed gates in the engine
 - [x] Engram layout verified against the checkpoint's own numbers (token map
       classes, table rows) by `tools/make_deepseek_v41_engram.py`
+- [x] Engram hash addressing implemented in C and pinned to the *official*
+      implementation (prefill and decode), `COLI_V41_UNIT_ENGRAM`
 - [ ] Shared KV/index, engram path, DSpark
 - [ ] Tiny oracle 32/32

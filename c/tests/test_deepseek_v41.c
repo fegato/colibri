@@ -24,6 +24,8 @@
 /* The routing and SwiGLU entry points live in the internal header, like the V4
  * engine's units and tests use them. */
 #include "deepseek_v41_internal.h"
+#include "deepseek_v41_engram_tables.h"
+#include "deepseek_v41_engram_vectors.h"
 
 /* A compact but *structurally complete* V4.1 config: the real checkpoint's keys,
  * shrunk to four backbone layers plus one DSpark stage. */
@@ -257,6 +259,72 @@ static void test_swiglu_clamp(void) {
           "swiglu() refuses an empty dimension");
 }
 
+
+/* The n-gram hash ids, against the golden vectors generated from the verified
+ * layout. These are the ids that index a 94.4 GiB table, so a single wrong bit is a
+ * different model: the addressing is checked here rather than assumed, and the same
+ * fixture holds the decode path to the prefill path. */
+static void test_engram_hash(void) {
+    int failures_before = failures;
+    for (int index = 0; index < coli_v41_engram_vector_count; index++) {
+        const ColiV41EngramVector *vector = &coli_v41_engram_vectors[index];
+        size_t columns = (size_t)vector->span_count * COLI_V41_ENGRAM_HASH_COLS;
+        int64_t *ids = malloc(columns * sizeof(*ids));
+        assert(ids != NULL);
+        check(coli_v41_engram_hash_ids(ids, vector->layer, vector->span,
+                                       vector->span_count, NULL, 0, 2) == 0,
+              "engram hash ids computed");
+        int matches = 0;
+        for (size_t column = 0; column < columns; column++)
+            if (ids[column] == vector->prefill[column])
+                matches++;
+        if (matches != (int)columns)
+            printf("      %s: %d/%zu prefill ids match\n", vector->name, matches, columns);
+        check(matches == (int)columns, vector->name);
+
+        /* the last position alone, with the rest as history: what a decode step sees */
+        int64_t decode[COLI_V41_ENGRAM_HASH_COLS];
+        check(coli_v41_engram_hash_ids(decode, vector->layer,
+                                       &vector->span[vector->span_count - 1], 1,
+                                       vector->span, vector->span_count - 1, 2) == 0,
+              "engram decode ids computed");
+        matches = 0;
+        for (int column = 0; column < COLI_V41_ENGRAM_HASH_COLS; column++)
+            if (decode[column] == vector->decode[column])
+                matches++;
+        check(matches == COLI_V41_ENGRAM_HASH_COLS, "decode ids match the prefill tail");
+        free(ids);
+    }
+    check(failures == failures_before, "every engram vector matched");
+}
+
+/* The class lookup and its fail-closed edges. */
+static void test_engram_compress(void) {
+    const uint32_t map[8] = {0, 1, 2, 2, 3, 4, 4, 5};
+    const int ids[6] = {0, 3, -1, 6, 7, 5};
+    int classes[6] = {0};
+    check(coli_v41_engram_compress(classes, ids, 6, map, 8, -1) == 0,
+          "compress accepts a well-formed run");
+    check(classes[0] == 0 && classes[1] == 2 && classes[5] == 4,
+          "compress maps ids onto their class");
+    check(classes[2] == -1, "the dead id blocks the n-gram (-1)");
+    /* an id with no class is a tokenizer mismatch, not something to guess at */
+    const int outside[1] = {9};
+    check(coli_v41_engram_compress(classes, outside, 1, map, 8, -1) != 0,
+          "compress refuses an id outside the map");
+    /* the layout's multiplier bound is what keeps class * multiplier inside int64 */
+    int64_t worst = 0;
+    for (int layer = 0; layer < COLI_V41_ENGRAM_LAYERS; layer++)
+        for (int shift = 0; shift < COLI_V41_ENGRAM_MAX_NGRAM; shift++)
+            if (coli_v41_engram_multipliers[layer][shift] > worst)
+                worst = coli_v41_engram_multipliers[layer][shift];
+    check((double)worst * (double)COLI_V41_ENGRAM_COMPRESSED_VOCAB < 9.2233720368547758e18,
+          "the frozen multipliers cannot overflow int64 at the largest class");
+    check(coli_v41_engram_layer_position(14) == 1 &&
+          coli_v41_engram_layer_position(7) == -1,
+          "engram layer ids map onto the layout positions");
+}
+
 int main(void) {
     printf("deepseek_v41 contract\n");
     test_config_shape();
@@ -264,6 +332,8 @@ int main(void) {
     test_source_table_validation();
     test_router();
     test_swiglu_clamp();
+    test_engram_hash();
+    test_engram_compress();
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
         return 1;

@@ -167,6 +167,18 @@ int coli_v41_rope_position(float *cosines, float *sines,
 int coli_v41_rope_apply(float *vectors, int vector_count, int dimension,
                        const float *cosines, const float *sines, int inverse);
 
+/* V41 DELTA: engram addressing. The tables are memory-mapped (94.4 GiB per layer),
+ * so this is the derived part: token id -> compressed class, and the n-gram hash
+ * ids that index a layer's table. Pinned to the reference by
+ * tests/deepseek_v41_engram_vectors.h. */
+int coli_v41_engram_layer_position(int layer_id);
+int coli_v41_engram_compress(int *classes, const int *ids, int count,
+                             const uint32_t *token_map, int map_count, int dead);
+int coli_v41_engram_hash_ids(int64_t *output, int layer_position,
+                             const int *classes, int count,
+                             const int *history, int history_count,
+                             int pad_class);
+
 int coli_v41_route(float *weights, int *indices, const float *hidden,
                   const float *gate, const float *bias,
                   const int *forced_indices, int experts, int dimension,
