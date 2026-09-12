@@ -201,6 +201,38 @@ Two consequences for the port:
   this documented fp4-to-fp8 cast at load time. It is a transformation, not an external tool,
   and the delta doc should say so rather than let the earlier wording stand.
 
+### The pin: the engine's fp4 read *is* the tensor the converter describes
+
+`tests/v41_ops_probe.c` reads a synthetic expert payload through the engine's own
+`coli_fp4_matvec_ref` (32 rows x 128 columns, every nibble code in both nibble positions,
+per-row 32-column exponents spanning `2**-2 .. 2**2`), and `tools/check_deepseek_v41_ops.py`
+dequantizes the *same* payload with the vendor's own `cast_e2m1fn_to_e4m3fn` -- lifted verbatim
+out of `convert.py`'s AST, so safetensors and tqdm (which their converter imports) are not
+needed to run their cast. The two sides must describe one tensor, so the comparison is an
+equality, not a tolerance:
+
+    fp4_expert_matvec   32x128 max |delta| 0.000e+00 (scales exercised: [0.25, 0.5, 1, 2, 4])
+    fp4_tables          e2m1 grid identical to the vendor's, e8m0 decode max |delta| 0.000e+00
+
+Scale 1 is one case among five, which is the pattern that hides a wrong rule. Three deliberate
+mistakes move the same comparison off zero -- high nibble on the even column 9.0, the scale
+block shifted by one 2.6, the fold ignored 189.0 -- so the check can fail. Verified on both
+hosts: MinGW-w64 gcc 16.2 and Ubuntu gcc 15.2 produce byte-identical records for these two ops
+(the only differences between the two captures are libm's last bits in `sinf`, in the
+hyper-connection record).
+
+So the checkpoint's fp4 payload with its per-row, per-32-column E8M0 exponent is exactly the
+layout the engine's expert store already streams (`block_rows == 1`, `block_columns == 32`), and
+`convert.py`'s fp4 -> fp8 cast is a converter *option* for the fp8-expert variant, not something
+a loader owes the checkpoint.
+
+The same reading finds the one thing that does have to change for the experts: the engine's fp4
+matvec quantizes the *activation* at 128 (`deepseek_v41.c:17074`, inherited from V4), while the
+reference passes `act_block_size=fp8_block_size` -- 32 -- for fp4 weights exactly as it does for
+fp8 ones (`model.py`, `linear()`), and `fp4_gemm`'s host wrapper asserts the activation scale
+count `== M * (K // act_block_size)`. The expert path needs the same 32-wide treatment as the
+dense path: one sweep, not a second one.
+
 ## The layout map, held to the checkpoint and to the loader
 
 `tools/deepseek_v41_layout.py` is the map the expert pin and the tiny fixture generator are

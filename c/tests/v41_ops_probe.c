@@ -139,5 +139,76 @@ int main(void) {
             printf("{\"op\":\"hc_split_sinkhorn\",\"error\":\"refused\"}\n");
         }
     }
+    /* The fp4 expert payload: exactly the arrangement the checkpoint stores -- packed nibbles
+     * along K with the low nibble on the even column, one UE8M0 exponent per row per 32
+     * columns -- read through the engine's own fp4 matvec, so the vendor's fp4->fp8 cast can
+     * be held to it. A single 0.5 in column 0 makes the activation vector exact at whatever
+     * scale the engine's activation quantizer picks (0.5 / 2**-9 = 256, representable), so
+     * every output is 0.5 * w[i][0] * scale(i, 0) with no rounding to argue about: the
+     * comparison tests the *weight* side, which is the encoding in question. */
+    {
+        enum { rows = 32, columns = 128, blocks = columns / 32 };
+        /* 32 rows, not fewer: the vendor's cast asserts out_dim % 32 == 0 */
+        static uint8_t data[rows * columns / 2];
+        static uint8_t scales[rows * blocks];
+        for (int index = 0; index < (int)sizeof(data); index++) {
+            /* every nibble code appears, in both nibble positions */
+            uint8_t low = (uint8_t)((index * 5 + 3) & 0x0F);
+            uint8_t high = (uint8_t)((index * 11 + 7) & 0x0F);
+            data[index] = (uint8_t)(low | (uint8_t)(high << 4));
+        }
+        /* exponents 2**-2 .. 2**2, so scale 1 (the pattern that hides a wrong rule) is
+         * one case among five, and the vendor's fp4-range fold has to be exercised */
+        for (int row = 0; row < rows; row++)
+            for (int block = 0; block < blocks; block++)
+                scales[row * blocks + block] = (uint8_t)(127 + ((row * 3 + block) % 5) - 2);
+
+        float input[columns];
+        memset(input, 0, sizeof(input));
+        input[0] = 0.5f;
+
+        ColiTensorView weight;
+        memset(&weight, 0, sizeof(weight));
+        weight.format = COLI_TENSOR_FP4_NATIVE_BLOCK;
+        weight.scale_format = COLI_SCALE_UE8M0;
+        weight.data = data;
+        weight.scales = scales;
+        weight.data_bytes = sizeof(data);
+        weight.scale_bytes = sizeof(scales);
+        weight.rows = rows;
+        weight.columns = columns;
+        weight.block_rows = 1;          /* one exponent per row ... */
+        weight.block_columns = 32;      /* ... per 32 columns along K */
+
+        float output[rows];
+        memset(output, 0, sizeof(output));
+        if (coli_fp4_matvec_ref(output, &weight, input) != 0) {
+            printf("{\"op\":\"fp4_expert_matvec\",\"error\":\"refused\"}\n");
+        } else {
+            printf("{\"op\":\"fp4_expert_matvec\",\"rows\":%d,\"columns\":%d,\"activation\":0.5,",
+                   rows, columns);
+            print_bytes("payload", data, sizeof(data));
+            printf(",");
+            print_bytes("scales", scales, sizeof(scales));
+            printf(",");
+            print_floats("output", output, rows);
+            printf("}\n");
+        }
+    }
+
+    /* The two tables the fp4 read is built from: the value grid and the exponent decode. */
+    {
+        static const uint8_t exponents[8] = {120, 125, 126, 127, 128, 129, 132, 140};
+        float grid[16], decoded[8];
+        for (int code = 0; code < 16; code++) grid[code] = coli_e2m1_decode((uint8_t)code);
+        for (int index = 0; index < 8; index++) decoded[index] = coli_e8m0_decode(exponents[index]);
+        printf("{\"op\":\"fp4_tables\",");
+        print_floats("e2m1", grid, 16);
+        printf(",");
+        print_bytes("e8m0_bytes", exponents, 8);
+        printf(",");
+        print_floats("e8m0", decoded, 8);
+        printf("}\n");
+    }
     return 0;
 }
