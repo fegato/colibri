@@ -277,6 +277,46 @@ The same run settles two claims the port rests on:
   The plan's scale rule is the other half of the same finding: `add_fp8` declares
   `(rows + 127) / 128`, a 128x128 block, for every fp8 tensor it names.
 
+## The tiny fixture, and what it falsified in the map
+
+`tools/make_deepseek_v41_tiny.py` generates the family's oracle input: 168 tensors, 1.7 MB, in
+`c/deepseek_v41_tiny/` (`config.json`, `tokenizer.json`, `model.safetensors`, `ref.json`). Its
+source of truth is the vendor's own architecture -- the released `model.py`, imported unmodified
+through the shim of `tools/deepseek_v41_reference.py`, filled with a fixed seed, quantized into
+the checkpoint's encodings, and written *back into the model* before any reference generation
+runs. So `ref.json`'s tokens are what those bytes produce. It needs no `transformers` (the V4
+generator does): `ModelArgs` already carries a tiny default config, and the narrow scope is
+vision off, `num_nextn_predict_layers: 0`, every `compress_ratio` 0 with no source layers, one
+engram layer, and the dense path in the checkpoint's real 32x32 geometry.
+
+Every tensor is checked against `tools/deepseek_v41_layout.py` **in both directions** -- the
+vendor model may not hold a parameter the map lacks, and the map may not name a tensor the
+fixture fails to produce -- and the map is then held to the released checkpoint again, unchanged
+(96,085 tensors). Two runs are byte-identical, which is what lets `ref.json` be a fixture rather
+than a record of one afternoon.
+
+The first tiny geometry falsified three of the map's rules, all of them *accidentally right* on
+the released checkpoint:
+
+| rule | was | is (the vendor's own construction) | why the checkpoint could not tell |
+| --- | --- | --- | --- |
+| `engram.q_weight`, `k_weight` | `[max_ngram_size, hidden]` | `[hc_mult, hidden]` (`nn.Parameter(torch.ones(args.hc_mult, args.dim))`) | `hc_mult == max_ngram_size == 4` there |
+| `engram.wkv` | `[5 * hidden, hidden + o_lora_rank]` | `[(hc_mult + 1) * hidden, (max_ngram_size - 1) * n_heads * head_dim]` | `5120 * 5 = 5 * hidden` and `3 * 8 * 256 = 6144 = hidden + o_lora_rank` |
+| `ffn.gate.bias_vl` | always present | only where a vision tower is (`bias_vl` masks image spans) | the released checkpoint has a `vision_config` |
+
+That is the fixture earning its keep before the engine can even load it: a shape rule read off
+the checkpoint's numbers is a hypothesis, and a geometry where the candidate formulas disagree is
+what turns it into a fact. The rules now come from the vendor's `__init__` calls, noted as such
+in the tool.
+
+`ref.json` carries three cases (`short`, `window` at 40 tokens, `engram` with repeated tokens)
+as per-position expectations, both greedy continuations and the argmax after every prefix. Those
+per-position expectations come from the *incremental* path -- one token per call with `start_pos`
+advancing, which is what the engine does -- because the vendor's head returns only the last
+position's logits by default (`Head.forward(..., full_logits=False)`). The generator asserts that
+a second walk over the same prefix reproduces the first, so a cache that carried state across
+walks would fail the fixture rather than the oracle.
+
 ## Shared KV / index: the exact mechanism
 
 From the reference (`ref:500-580`, `ref:722-778`):

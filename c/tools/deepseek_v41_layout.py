@@ -177,6 +177,7 @@ class Geometry:
     engram_layers: list[int]
     engram_rows: list[int]
     engram_head_dim: int
+    engram_heads: int
     engram_max_ngram: int
     kv_sources: list[int]
     index_sources: list[int]
@@ -207,6 +208,7 @@ class Geometry:
             engram_layers=list(text["engram_layer_ids"]),
             engram_rows=list(text["engram_num_embeddings"]),
             engram_head_dim=text["engram_head_dim"],
+            engram_heads=text["engram_n_heads"],
             engram_max_ngram=text["engram_max_ngram_size"],
             kv_sources=list(text["kv_source_layer_ids"]),
             index_sources=list(text["index_source_layer_ids"]),
@@ -291,16 +293,25 @@ def build_layout(geometry: Geometry, names: str = "checkpoint") -> list[Entry]:
         if layer in g.engram_layers:
             position = g.engram_layers.index(layer)
             rows = g.engram_rows[position]
-            add(prefix + "engram.q_weight", BF16_RAW, [g.engram_max_ngram, g.hidden])
-            add(prefix + "engram.k_weight", BF16_RAW, [g.engram_max_ngram, g.hidden])
-            add(prefix + "engram.wkv.weight", FP8_32X32, [5 * g.hidden, g.hidden + g.o_rank],
+            add(prefix + "engram.q_weight", BF16_RAW, [g.hc, g.hidden])
+            add(prefix + "engram.k_weight", BF16_RAW, [g.hc, g.hidden])
+            # the vendor's own construction: Linear(n_hash_cols * head_dim, dim * (hc_mult + 1))
+            # with n_hash_cols = (max_ngram_size - 1) * n_heads. On the released checkpoint both
+            # spellings coincide (3*8*256 = 6144 = hidden + o_lora_rank, 5120*5 = 5*hidden), so a
+            # tiny geometry is what tells the two apart -- see the delta doc.
+            add(prefix + "engram.wkv.weight", FP8_32X32,
+                [(g.hc + 1) * g.hidden, (g.engram_max_ngram - 1) * g.engram_heads * g.engram_head_dim],
                 scale=True)
             add(prefix + "engram.embed.weight", FP8_ROW32, [rows, g.engram_head_dim], scale=True)
 
         # MoE
         add(prefix + "ffn.gate.weight", BF16_RAW, [g.experts, g.hidden])
         add(prefix + "ffn.gate.bias", F32_RAW, [g.experts])
-        add(prefix + "ffn.gate.bias_vl", F32_RAW, [g.experts])
+        if g.vision is not None:
+            # the vision-masked routing bias exists exactly where there is a vision tower to
+            # mask; a text-only checkpoint has none, and the engine only applies it when an
+            # image span is present (the vendor's model allocates it with the vision tower too)
+            add(prefix + "ffn.gate.bias_vl", F32_RAW, [g.experts])
         add(prefix + "ffn.shared_experts.w1.weight", FP8_32X32, [g.moe, g.hidden], scale=True)
         add(prefix + "ffn.shared_experts.w2.weight", FP8_32X32, [g.hidden, g.moe], scale=True)
         add(prefix + "ffn.shared_experts.w3.weight", FP8_32X32, [g.moe, g.hidden], scale=True)
@@ -335,7 +346,8 @@ def build_layout(geometry: Geometry, names: str = "checkpoint") -> list[Entry]:
         add(prefix + "attn.wo_b.weight", FP8_32X32, [g.hidden, g.o_width], scale=True)
         add(prefix + "ffn.gate.weight", BF16_RAW, [g.dspark_experts, g.hidden])
         add(prefix + "ffn.gate.bias", F32_RAW, [g.dspark_experts])
-        add(prefix + "ffn.gate.bias_vl", F32_RAW, [g.dspark_experts])
+        if g.vision is not None:
+            add(prefix + "ffn.gate.bias_vl", F32_RAW, [g.dspark_experts])
         add(prefix + "ffn.shared_experts.w1.weight", FP8_32X32, [g.moe, g.hidden], scale=True)
         add(prefix + "ffn.shared_experts.w2.weight", FP8_32X32, [g.hidden, g.moe], scale=True)
         add(prefix + "ffn.shared_experts.w3.weight", FP8_32X32, [g.moe, g.hidden], scale=True)
