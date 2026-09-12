@@ -1027,6 +1027,7 @@ class FamilyRegistryTest(unittest.TestCase):
                       "<|im_end|>\n<|im_start|>user\nhello {world}<|im_end|>\n"
                       "<|im_start|>assistant\n<think>\n",
             "deepseek_v4": "hello {world}",
+            "deepseek_v41": "hello {world}",
         }
         self.assertEqual(
             {family.id: tuning_replay_prompt(family, prompt) for family in FAMILIES},

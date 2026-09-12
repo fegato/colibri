@@ -689,6 +689,54 @@ def _dsv4_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _dsv41_geometry(config, context, _model_dir):
+    """DeepSeek V4.1-Flash: same compressor/indexer budget shape as V4.
+
+    V4.1 keeps sliding_window + compress_ratios + index_head_dim in
+    text_config, so the byte math mirrors _dsv4_geometry exactly. Two
+    deliberate overestimates until the engine models them: layers listed in
+    kv_source_layer_ids reuse another layer's KV (we budget one KV per
+    layer anyway), and the engram tables are dense weights, not cache.
+    Over-budgeting only ever slows the plan; under-budgeting would OOM it.
+    """
+    layers = _required_int(config, "num_hidden_layers", "deepseek_v41")
+    experts = _required_int(config, "n_routed_experts", "deepseek_v41")
+    hidden = _required_int(config, "hidden_size", "deepseek_v41")
+    heads = _required_int(config, "num_attention_heads", "deepseek_v41")
+    head_dim = _required_int(config, "head_dim", "deepseek_v41")
+    q_rank = _required_int(config, "q_lora_rank", "deepseek_v41")
+    o_groups = _required_int(config, "o_groups", "deepseek_v41")
+    o_rank = _required_int(config, "o_lora_rank", "deepseek_v41")
+    window = _required_int(config, "sliding_window", "deepseek_v41")
+    index_hd = _required_int(config, "index_head_dim", "deepseek_v41")
+
+    ratios = config.get("compress_ratios")
+    if not isinstance(ratios, list) or len(ratios) < layers:
+        raise ValueError(
+            "deepseek_v41: compress_ratios must be a list of at least "
+            "num_hidden_layers entries")
+
+    fixed = layers * window * head_dim * 4
+
+    state = 0
+    for ratio in ratios[:layers]:
+        if not isinstance(ratio, bool) and isinstance(ratio, int) and ratio > 0:
+            compressed = (context + ratio - 1) // ratio
+            state += compressed * head_dim * 4
+            if ratio == 4:
+                state += compressed * index_hd * 4
+        elif ratio != 0:
+            raise ValueError("deepseek_v41: compress_ratios entries must be "
+                             "non-negative integers")
+
+    q_width = heads * head_dim
+    oa_width = o_groups * o_rank
+    workspace = (context * (q_rank + 2 * q_width + head_dim + oa_width) +
+                 max(q_rank, head_dim)) * 4
+
+    return PlannerGeometry(state, fixed, workspace, experts)
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -697,6 +745,10 @@ _KIMI_EXPERT = re.compile(
     r"experts\.(\d+)\."
 )
 _V4_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.")
+# V4.1 keeps the DeepSeek decoder-block naming (confirm against the first
+# shard header when weights are staged; the converter must fail closed on
+# any name this does not classify, per the project rule).
+_V41_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.")
 _GLM53_EXPERT = re.compile(
     r"^model\.(?:language_model\.)?layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -1189,6 +1241,40 @@ FAMILIES = (
         capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
+    ),
+    FamilyDescriptor(
+        id="deepseek_v41",
+        model_types=("deepseek_v41",),
+        display_name="DeepSeek V4.1 Flash",
+        display_scale="552B",
+        # deepseek-ai/DeepSeek-V4.1-Flash config.json: 40 layer, hidden
+        # 5120, 384 routed experts + 1 shared, top-6, sqrtsoftplus router,
+        # shared KV/index source layers, engram tables, DSpark layers.
+        # NEW architecture vs V4, not a re-quant: the engine is still a
+        # stub that fails closed (c/deepseek_v41.c), so both adapters stay
+        # off until the port lands. Registry + planner work now, so
+        # `coli doctor` sizes the model honestly instead of answering
+        # "unsupported model_type".
+        reference_experts=384,
+        engine_artifact="deepseek_v41",
+        engine_aliases=(),
+        engine_group="deepseek_v41",
+        internal_arch="deepseek_v41",
+        build_target="deepseek_v41",
+        process_names=("deepseek_v41",),
+        default_model_id="deepseek-v41-colibri",
+        cli_adapter="deepseek_v41",
+        gateway_adapter="deepseek_v41",
+        planner_id="deepseek_v41",
+        planner_geometry=_dsv41_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_individual_expert_inventory(_V41_EXPERT),
+        config_section="text_config",
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
+        capabilities=FamilyCapabilities(True, False, False, True),
+        has_gateway_adapter=False,
+        has_cli_adapter=False,
+        supports_accelerator=False,
     ),
 )
 
