@@ -78,9 +78,12 @@ def _scale_to_float(scale: torch.Tensor) -> torch.Tensor:
 
 
 def _round_to_e2m1(value: torch.Tensor) -> torch.Tensor:
+    """Nearest e2m1 CODE INDEX (0..15), which is what the packed storage holds."""
     grid = torch.tensor(E2M1_GRID, dtype=value.dtype, device=value.device)
     magnitude = value.abs().unsqueeze(-1)
-    return torch.sign(value) * grid[(magnitude - grid).abs().argmin(dim=-1)]
+    index = (magnitude - grid).abs().argmin(dim=-1).to(torch.uint8)
+    return index + torch.where(value < 0, torch.tensor(8, dtype=torch.uint8, device=value.device),
+                               torch.tensor(0, dtype=torch.uint8, device=value.device))
 
 
 def _unpack_e2m1(packed: torch.Tensor) -> torch.Tensor:
@@ -108,15 +111,15 @@ def act_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, inpl
     amax = blocks.abs().amax(dim=-1, keepdim=True)
     scale = _e8m0_scale(amax, FP8_MAX) if scale_fmt is not None else \
         torch.clamp(amax, min=1e-4) / FP8_MAX
-    quantized = (torch.clamp(blocks / scale, -FP8_MAX, FP8_MAX)
-                 .to(torch.float8_e4m3fn).float() * scale)
-    out = quantized.reshape(*lead, n)
+    # the codes, NOT the dequantized values: multiplying back here and casting again would
+    # quantize a second time at scale 1, which only looks right when the scale is 1
+    codes = torch.clamp(blocks / scale, -FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
     if inplace:
-        x.copy_(out.to(x.dtype))
+        x.copy_((codes.float() * scale).reshape(*lead, n).to(x.dtype))
         return x
     scale_out = (_e8m0_bytes(scale.squeeze(-1)) if scale_dtype == torch.float8_e8m0fnu
                  else scale.squeeze(-1).float())
-    return out.to(torch.float8_e4m3fn), scale_out
+    return codes.reshape(*lead, n), scale_out
 
 
 def fp4_act_quant(x, block_size=32, inplace=False, scale_dtype=torch.float8_e8m0fnu):
@@ -133,21 +136,19 @@ def fp4_act_quant(x, block_size=32, inplace=False, scale_dtype=torch.float8_e8m0
     else:
         scale = _e8m0_scale(amax, FP4_MAX)
         scale_out = _e8m0_bytes(scale.squeeze(-1))
-    out = (_round_to_e2m1(torch.clamp(blocks / scale, -FP4_MAX, FP4_MAX)) * scale)
-    out = out.reshape(*lead, n)
+    codes = _round_to_e2m1(torch.clamp(blocks / scale, -FP4_MAX, FP4_MAX))
     if inplace:
-        x.copy_(out.to(x.dtype))
+        x.copy_((codes * scale).reshape(*lead, n).to(x.dtype))
         return x
-    # the kernel returns the packed [..., N // 2] tensor; keep it byte-shaped here
-    return _pack_e2m1(out).reshape(*lead[:-1], n // 2), scale_out
+    # the kernel returns the packed [..., N // 2] tensor: pack the codes, not their values
+    return _pack_codes(codes).reshape(*lead[:-1], n // 2), scale_out
 
 
-def _pack_e2m1(value: torch.Tensor) -> torch.Tensor:
-    codes = (value.abs().unsqueeze(-1) - torch.tensor(E2M1_GRID, dtype=value.dtype,
-                                                      device=value.device)).abs().argmin(-1)
-    codes = torch.where(value < 0, codes + 8, codes).to(torch.uint8)
-    codes = codes.reshape(*value.shape[:-1], value.shape[-1] // 2, 2)
-    return codes[..., 0] | (codes[..., 1] << 4)
+def _pack_codes(codes: torch.Tensor) -> torch.Tensor:
+    """Pack e2m1 code indices (0..15, sign in bit 3) two per byte, low nibble first."""
+    nibbles = codes.to(torch.uint8)
+    nibbles = nibbles.reshape(*codes.shape[:-1], codes.shape[-1] // 2, 2)
+    return nibbles[..., 0] | (nibbles[..., 1] << 4)
 
 
 def _dequant_weight(values, scales, rows, columns, block):
