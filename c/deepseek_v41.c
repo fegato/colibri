@@ -1747,12 +1747,15 @@ int coli_v41_swiglu(float *output, const float *gate, const float *up,
  * with the reference rules, so this code is pinned to the reference without any
  * weights. See docs/deepseek-v41-delta.md.
  * ------------------------------------------------------------------------- */
+#include "deepseek_v41_internal.h"
 #include "deepseek_v41_engram_tables.h"
 #include "deepseek_v41_engram_tokens.h"
 #include "native_quant.h"
 
+#include <fcntl.h>
 #include <math.h>
 #include <string.h>
+#include <unistd.h>
 
 /* A position that takes no part in an n-gram (an image span), like the reference's
  * NgramHashState.DEAD. */
@@ -1907,6 +1910,230 @@ int coli_v41_engram_gate(float *output, const float *stream, const float *key,
         float *destination = output + (size_t)copy * (size_t)dim;
         for (int column = 0; column < dim; column++)
             destination[column] = h[column] + gate * value[column];
+    }
+    return 0;
+}
+
+/* ---- fp8 matvec with the block geometry the tensor carries ----------------- *
+ *
+ * The V4 engine's shared matvec hardcodes 128-wide quantization blocks (V4's
+ * weight_block_size is [128, 128]). V4.1's is [32, 32]: every scale tensor in the
+ * released checkpoint is shaped [rows / 32, columns / 32] -- wq_a [40, 160] for
+ * [1280, 5120], engram.wkv [800, 192] for [25600, 6144] -- so the whole dense path
+ * needs the block width from the view, not a constant. This is that matvec, used
+ * here by the engram projection; the dense layers still need the same treatment
+ * before the engine can run a V4.1 layer (docs/deepseek-v41-delta.md).
+ *
+ * The activation is quantized to fp8 over the same block width, exactly as the
+ * reference's Linear does before its fp8 GEMM, using the engine's shared
+ * activation qdq. */
+int coli_v41_fp8_matvec_blocked(float *output, const ColiTensorView *weight,
+                                const float *input) {
+    if (!output || !input || !weight || !weight->data || !weight->scales)
+        return -1;
+    if (weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        weight->scale_format != COLI_SCALE_F32)
+        return -1;
+    int block_columns = (int)weight->block_columns;
+    int block_rows = (int)weight->block_rows;
+    if (block_columns != 32 && block_columns != 64 && block_columns != 128)
+        return -1;
+    if (block_rows < 1)
+        return -1;
+    size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
+    if (rows < 1 || columns < 1 || columns % (size_t)block_columns)
+        return -1;
+    size_t scale_rows = (rows + (size_t)block_rows - 1) / (size_t)block_rows;
+    size_t scale_columns = columns / (size_t)block_columns;
+    if (weight->data_bytes != rows * columns ||
+        weight->scale_bytes != scale_rows * scale_columns * sizeof(float))
+        return -1;
+    float *activation = NULL;
+    uint8_t *activation_scales = NULL;
+    if (coli_v4_qdq_scratch(columns, scale_columns, &activation,
+                            &activation_scales) != 0)
+        return -1;
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales, input, columns,
+                                    block_columns) != 0)
+        return -1;
+    const uint8_t *data = weight->data;
+    const float *scales = weight->scales;
+    for (size_t row = 0; row < rows; row++) {
+        const uint8_t *values = data + row * columns;
+        const float *row_scales = scales + (row / (size_t)block_rows) * scale_columns;
+        float sum = 0.0f;
+        for (size_t column = 0; column < columns; column++)
+            sum += coli_e4m3fn_decode(values[column]) *
+                   row_scales[column / (size_t)block_columns] * activation[column];
+        output[row] = sum;
+    }
+    return 0;
+}
+
+/* ---- the table, memory-mapped -------------------------------------------- */
+
+/* A layer's engram table, mapped read-only. The tables are 94.4 GiB each and only
+ * ~24 rows per token are ever touched, so they are never loaded: the mapping is
+ * file-backed and the pages the model actually reads stay in the OS cache. That is
+ * the same primitive the expert store avoids and the engine uses elsewhere for
+ * already-final safetensors. */
+int coli_v41_engram_table_open(ColiV41EngramTable *table, const char *shard_path,
+                               int64_t weight_offset, size_t weight_bytes,
+                               int64_t scale_offset, size_t scale_bytes,
+                               int head_dim, char *error, size_t error_size) {
+    if (!table || !shard_path || head_dim < 32 || (head_dim % 32) != 0 ||
+        weight_bytes == 0 || scale_bytes == 0)
+        return -1;
+    memset(table, 0, sizeof(*table));
+    /* The two tensors describe the same rows: weight is head_dim bytes per row and
+     * scale one E8M0 byte per 32 columns. If they disagree the checkpoint is not
+     * the model this engine loads, and a wrong row stride would read plausible
+     * garbage for the rest of the run. */
+    size_t scale_row_bytes = (size_t)head_dim / 32;
+    if (weight_bytes % (size_t)head_dim != 0 || scale_bytes % scale_row_bytes != 0 ||
+        weight_bytes / (size_t)head_dim != scale_bytes / scale_row_bytes) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "engram table shape mismatch: %zu weight bytes and %zu scale "
+                     "bytes do not describe the same rows at head_dim %d",
+                     weight_bytes, scale_bytes, head_dim);
+        return -1;
+    }
+    int descriptor = open(shard_path, COMPAT_O_RDONLY | COMPAT_O_BINARY);
+    if (descriptor < 0) {
+        if (error && error_size)
+            snprintf(error, error_size, "cannot open %s", shard_path);
+        return -1;
+    }
+    const void *rows = NULL, *scales = NULL;
+    if (compat_map_readonly(descriptor, weight_offset, weight_bytes,
+                            &table->weight_map, &rows) != 0 ||
+        compat_map_readonly(descriptor, scale_offset, scale_bytes,
+                            &table->scale_map, &scales) != 0) {
+        compat_unmap_readonly(&table->weight_map);
+        close(descriptor);
+        if (error && error_size)
+            snprintf(error, error_size, "cannot map %s", shard_path);
+        return -1;
+    }
+    close(descriptor);          /* the mappings own their pages from here */
+    table->rows = (const uint8_t *)rows;
+    table->row_count = (int64_t)(weight_bytes / (size_t)head_dim);
+    table->rows_bytes = weight_bytes;
+    table->scales = (const uint8_t *)scales;
+    table->scales_bytes = scale_bytes;
+    return 0;
+}
+
+void coli_v41_engram_table_close(ColiV41EngramTable *table) {
+    if (!table)
+        return;
+    compat_unmap_readonly(&table->weight_map);
+    compat_unmap_readonly(&table->scale_map);
+    table->rows = NULL;
+    table->scales = NULL;
+    table->rows_bytes = 0;
+    table->scales_bytes = 0;
+    table->row_count = 0;
+}
+
+/* ---- the workspace ------------------------------------------------------- */
+
+int coli_v41_engram_workspace_init(ColiV41EngramWorkspace *work, int hash_cols,
+                                   int head_dim, int hc_mult, int dim,
+                                   int max_positions) {
+    if (!work || hash_cols < 1 || head_dim < 1 || hc_mult < 1 || dim < 1 ||
+        max_positions < 1)
+        return -1;
+    memset(work, 0, sizeof(*work));
+    work->max_positions = max_positions;
+    work->hash_cols = hash_cols;
+    work->head_dim = head_dim;
+    work->hc_mult = hc_mult;
+    work->dim = dim;
+    work->rows = malloc((size_t)hash_cols * (size_t)head_dim * sizeof(float));
+    /* one position's hashes are hash_cols wide, so the buffer scales with the
+     * longest span the workspace is allowed to serve */
+    work->hashes = malloc((size_t)max_positions * (size_t)hash_cols * sizeof(int64_t));
+    work->projection = malloc((size_t)(hc_mult * dim + dim) * sizeof(float));
+    work->weight = malloc((size_t)hc_mult * (size_t)dim * sizeof(float));
+    if (!work->rows || !work->hashes || !work->projection || !work->weight) {
+        coli_v41_engram_workspace_free(work);
+        return -1;
+    }
+    return 0;
+}
+
+void coli_v41_engram_workspace_free(ColiV41EngramWorkspace *work) {
+    if (!work)
+        return;
+    free(work->rows);
+    free(work->hashes);
+    free(work->projection);
+    free(work->weight);
+    work->rows = NULL;
+    work->hashes = NULL;
+    work->projection = NULL;
+    work->weight = NULL;
+}
+
+/* One position's contribution, from its hash ids to the residual write.
+
+ * `wkv` is the layer's fp8 weight [hc_mult*dim + dim, hash_cols*head_dim]; the
+ * matvec is the engine's shared fp8 matvec, so this adds no new quantized maths.
+ * `weight` is q_weight * k_weight, the only form the reference ever uses them in,
+ * and is the caller's one-time product per layer. */
+int coli_v41_engram_apply(float *stream, int hc_mult, int dim,
+                          const int64_t *hashes,
+                          const ColiV41EngramTable *table, int head_dim,
+                          const ColiTensorView *wkv, const float *weight,
+                          float eps, ColiV41EngramWorkspace *work) {
+    if (!stream || !hashes || !table || !table->rows || !table->scales ||
+        !wkv || !weight || !work || hc_mult < 1 || dim < 1 || head_dim < 1)
+        return -1;
+    if (work->hash_cols * work->head_dim != wkv->columns ||
+        hc_mult * dim + dim != (int)wkv->rows)
+        return -1;
+    if (work->head_dim != head_dim || work->dim != dim || work->hc_mult != hc_mult)
+        return -1;
+    if (coli_v41_engram_fetch_rows(work->rows, hashes, work->hash_cols, head_dim,
+                                   table->rows, table->rows_bytes, table->scales,
+                                   table->scales_bytes) != 0)
+        return -1;
+    if (coli_v41_fp8_matvec_blocked(work->projection, wkv, work->rows) != 0)
+        return -1;
+    const float *key = work->projection;
+    const float *value = work->projection + hc_mult * dim;
+    return coli_v41_engram_gate(stream, stream, key, value, weight, hc_mult, dim,
+                                eps);
+}
+
+/* Hash ids for a span of one engram layer, then the contribution for every
+ * position of it. This is what a prefill chunk and a decode step both call: the
+ * decode step passes its recent classes as history, so both see the same window. */
+int coli_v41_engram_span(float *stream, int hc_mult, int dim,
+                         const int *classes, int count, const int *history,
+                         int history_count, int pad_class, int layer_position,
+                         const ColiV41EngramTable *table, int head_dim,
+                         const ColiTensorView *wkv, const float *weight,
+                         float eps, ColiV41EngramWorkspace *work) {
+    if (!stream || !classes || count < 0 || !work)
+        return -1;
+    if (count > work->max_positions)
+        return -1;
+    if (coli_v41_engram_hash_ids(work->hashes, layer_position, classes, count,
+                                 history, history_count, pad_class) != 0)
+        return -1;
+    for (int position = 0; position < count; position++) {
+        /* every position keeps its own hc copies: the contribution is added where
+         * the position sits in the stream, not folded together */
+        if (coli_v41_engram_apply(stream + (size_t)position * (size_t)hc_mult *
+                                              (size_t)dim,
+                                  hc_mult, dim,
+                                  work->hashes + (size_t)position *
+                                                 (size_t)work->hash_cols,
+                                  table, head_dim, wkv, weight, eps, work) != 0)
+            return -1;
     }
     return 0;
 }

@@ -20,11 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "deepseek_v41.h"
+#include "../deepseek_v41.h"
 /* The routing and SwiGLU entry points live in the internal header, like the V4
  * engine's units and tests use them. */
-#include "deepseek_v41_internal.h"
-#include "deepseek_v41_engram_tables.h"
+#include "../deepseek_v41_internal.h"
+#include "../deepseek_v41_engram_tables.h"
 #include "deepseek_v41_engram_vectors.h"
 #include "deepseek_v41_engram_map_checks.h"
 
@@ -353,6 +353,282 @@ static void test_engram_contribution(void) {
           "gate refuses a negative eps");
 }
 
+
+
+/* The blocked fp8 matvec, against a hand-computed product.
+ * A 1x32 weight of all zeros except w[0] = 1.0 (E4M3 0x38) and w[1] = 0.5 (0x30),
+ * one f32 scale of 2.0, and an input whose two leading entries are 1.0 and 1.0:
+ * the qdq of the activation is exact here (both values are representable), so the
+ * expected output is (1.0*2.0*1.0) + (0.5*2.0*1.0) = 3.0. */
+static void test_fp8_matvec_blocked(void) {
+    enum { columns = 32, rows = 1 };
+    uint8_t data[rows * columns];
+    float scales[1] = {2.0f};
+    memset(data, 0x00, sizeof(data));
+    data[0] = 0x38;   /* 1.0  */
+    data[1] = 0x30;   /* 0.5  */
+    float input[columns];
+    for (int index = 0; index < columns; index++)
+        input[index] = index < 2 ? 1.0f : 0.0f;
+    ColiTensorView weight;
+    memset(&weight, 0, sizeof(weight));
+    weight.format = COLI_TENSOR_FP8_E4M3_BLOCK;
+    weight.scale_format = COLI_SCALE_F32;
+    weight.data = data;
+    weight.scales = scales;
+    weight.data_bytes = sizeof(data);
+    weight.scale_bytes = sizeof(scales);
+    weight.rows = rows;
+    weight.columns = columns;
+    weight.block_rows = 32;
+    weight.block_columns = 32;
+    float output[rows] = {0.0f};
+    check(coli_v41_fp8_matvec_blocked(output, &weight, input) == 0,
+          "blocked matvec runs on a 32-wide block");
+    check(fabsf(output[0] - 3.0f) < 1e-5f,
+          "blocked matvec matches the hand-computed product");
+    /* 128-wide views are the V4 geometry and stay accepted; a width nobody uses is
+     * refused instead of guessed */
+    weight.block_columns = 128;
+    check(coli_v41_fp8_matvec_blocked(output, &weight, input) != 0,
+          "a 128-wide block over 32 columns is refused (scale size disagrees)");
+    weight.block_columns = 16;
+    check(coli_v41_fp8_matvec_blocked(output, &weight, input) != 0,
+          "an unsupported block width is refused");
+    weight.block_columns = 32;
+    weight.scale_bytes = sizeof(scales) * 4;
+    check(coli_v41_fp8_matvec_blocked(output, &weight, input) != 0,
+          "a scale size that does not match the geometry is refused");
+}
+
+/* Build a tiny shard on disk and map the table out of it: the mapping is the real
+ * primitive, and this is the only way to exercise it without a 94 GiB checkpoint. */
+static int write_shard(const char *path, const uint8_t *rows, size_t rows_bytes,
+                       const uint8_t *scales, size_t scales_bytes) {
+    FILE *stream = fopen(path, "wb");
+    if (!stream)
+        return -1;
+    int ok = fwrite(rows, 1, rows_bytes, stream) == rows_bytes &&
+             fwrite(scales, 1, scales_bytes, stream) == scales_bytes;
+    fclose(stream);
+    return ok ? 0 : -1;
+}
+
+static void test_engram_table_map(void) {
+    enum { head_dim = 32, rows = 4 };
+    uint8_t table[rows * head_dim];
+    uint8_t scales[rows];
+    for (int index = 0; index < rows * head_dim; index++)
+        table[index] = (uint8_t)(0x34 + index % 12);
+    for (int index = 0; index < rows; index++)
+        scales[index] = 127;
+
+    char path[512];
+    snprintf(path, sizeof(path), "deepseek_v41_table_%d.bin", (int)getpid());
+    check(write_shard(path, table, sizeof(table), scales, sizeof(scales)) == 0,
+          "synthetic shard written");
+    ColiV41EngramTable mapped;
+    char error[256] = {0};
+    check(coli_v41_engram_table_open(&mapped, path, 0, sizeof(table),
+                                     (int64_t)sizeof(table), sizeof(scales),
+                                     head_dim, error, sizeof(error)) == 0,
+          "the table maps out of the shard");
+    if (mapped.rows) {
+        check(mapped.row_count == rows, "the row count comes from the byte sizes");
+        int same = 1;
+        for (int index = 0; index < rows * head_dim; index++)
+            if (mapped.rows[index] != table[index]) same = 0;
+        for (int index = 0; index < rows; index++)
+            if (mapped.scales[index] != scales[index]) same = 0;
+        check(same, "the mapped bytes are the bytes on disk");
+    }
+    coli_v41_engram_table_close(&mapped);
+    check(mapped.rows == NULL && mapped.row_count == 0, "closing releases the view");
+
+    /* the two tensors must describe the same rows, or every row stride after the
+     * first is wrong */
+    check(coli_v41_engram_table_open(&mapped, path, 0, sizeof(table),
+                                     (int64_t)sizeof(table), rows * 2, head_dim,
+                                     error, sizeof(error)) != 0,
+          "disagreeing weight/scale sizes are refused");
+    check(coli_v41_engram_table_open(&mapped, path, 0, sizeof(table), 0,
+                                     sizeof(scales), 16, error, sizeof(error)) != 0,
+          "a head_dim that is not a multiple of 32 is refused");
+    check(coli_v41_engram_table_open(&mapped, "does-not-exist.bin", 0, sizeof(table),
+                                     0, sizeof(scales), head_dim, error,
+                                     sizeof(error)) != 0,
+          "a missing shard is refused with an error");
+    remove(path);
+}
+
+/* The driver, end to end on a synthetic table and a synthetic wkv. The projection
+ * is the engine's shared fp8 matvec, so what is checked here is the plumbing: the
+ * split offsets, the per-position routing and the fail-closed shape checks. */
+static void test_engram_apply(void) {
+    enum { head_dim = 32, hash_cols = 24, hc_mult = 2, dim = 4,
+           out_rows = hc_mult * dim + dim };
+    uint8_t table[4 * head_dim];
+    uint8_t scales[4];
+    for (int index = 0; index < 4 * head_dim; index++)
+        table[index] = (uint8_t)(0x34 + index % 12);
+    for (int index = 0; index < 4; index++)
+        scales[index] = 127;
+    char path[512];
+    snprintf(path, sizeof(path), "deepseek_v41_apply_%d.bin", (int)getpid());
+    check(write_shard(path, table, sizeof(table), scales, sizeof(scales)) == 0,
+          "synthetic shard written for the driver");
+    ColiV41EngramTable mapped;
+    char error[256] = {0};
+    int opened = coli_v41_engram_table_open(&mapped, path, 0, sizeof(table),
+                                            (int64_t)sizeof(table), sizeof(scales),
+                                            head_dim, error, sizeof(error)) == 0;
+
+    ColiV41EngramWorkspace work;
+    check(coli_v41_engram_workspace_init(&work, hash_cols, head_dim, hc_mult, dim, 2) == 0,
+          "the workspace allocates");
+    const float weight[hc_mult * dim] = {1.0f, 1.0f, 1.0f, 1.0f,
+                                         1.0f, 1.0f, 1.0f, 1.0f};
+
+    /* an all-zero wkv projects to zero, so the engram adds nothing: a clean anchor
+     * that does not depend on the quantized maths */
+    size_t wkv_bytes = (size_t)out_rows * hash_cols * head_dim;
+    size_t wkv_scale_entries = (size_t)out_rows * (hash_cols * head_dim / 32);
+    size_t wkv_scale_bytes = wkv_scale_entries * sizeof(float);
+    uint8_t *wkv_data = calloc(wkv_bytes, 1);
+    float *wkv_scales = malloc(wkv_scale_bytes);
+    assert(wkv_data && wkv_scales);
+    for (size_t entry = 0; entry < wkv_scale_entries; entry++)
+        wkv_scales[entry] = 1.0f;
+    /* the engine's view convention: fp8 e4m3 with f32 scales already expanded from
+     * the checkpoint's E8M0 bytes, one scale per 32x32 block (V4.1's
+     * weight_block_size; V4 was 128x128) */
+    ColiTensorView wkv;
+    memset(&wkv, 0, sizeof(wkv));
+    wkv.format = COLI_TENSOR_FP8_E4M3_BLOCK;
+    wkv.scale_format = COLI_SCALE_F32;
+    wkv.data = wkv_data;
+    wkv.scales = wkv_scales;
+    wkv.data_bytes = wkv_bytes;
+    wkv.scale_bytes = wkv_scale_bytes;
+    wkv.rows = out_rows;
+    wkv.columns = hash_cols * head_dim;
+    /* one scale row per weight row here: 12 rows do not fill a 32-row block, and
+     * the block geometry itself is checked in test_fp8_matvec_blocked */
+    wkv.block_rows = 1;
+    wkv.block_columns = 32;
+
+    float stream[hc_mult * dim] = {1.0f, 2.0f, 3.0f, 4.0f, -1.0f, -2.0f, 0.5f, 0.25f};
+    float original[hc_mult * dim];
+    memcpy(original, stream, sizeof(stream));
+    int64_t hashes[hash_cols];
+    for (int index = 0; index < hash_cols; index++)
+        hashes[index] = index % 4;
+    if (opened) {
+        check(coli_v41_engram_apply(stream, hc_mult, dim, hashes, &mapped, head_dim,
+                                    &wkv, weight, 1e-6f, &work) == 0,
+              "apply runs on a well-formed table");
+        int untouched = 1;
+        for (int index = 0; index < hc_mult * dim; index++)
+            if (stream[index] != original[index]) untouched = 0;
+        check(untouched, "a zero projection leaves the stream untouched");
+        /* a row id past the end of the table is refused, not read past */
+        int64_t outside[hash_cols];
+        for (int index = 0; index < hash_cols; index++)
+            outside[index] = 4;
+        check(coli_v41_engram_apply(stream, hc_mult, dim, outside, &mapped, head_dim,
+                                    &wkv, weight, 1e-6f, &work) != 0,
+              "a hash row past the table end is refused");
+        /* a wkv whose columns do not match the hash width is refused */
+        ColiTensorView wrong = wkv;
+        wrong.columns = hash_cols * head_dim - 32;
+        check(coli_v41_engram_apply(stream, hc_mult, dim, hashes, &mapped, head_dim,
+                                    &wrong, weight, 1e-6f, &work) != 0,
+              "a wkv that does not match the hash width is refused");
+    }
+    /* The span driver, and why it has to refuse this table: the real hash ids are
+     * offsets over 24 primes (millions of rows), so a 4-row synthetic shard cannot
+     * hold them. That refusal IS the fail-closed property. The per-position routing
+     * is checked separately, with a wkv whose rows pick different input columns, so
+     * two positions with different hashes must leave different residuals. */
+    const int classes[2] = {1, 2};
+    int64_t span_hashes[2 * hash_cols];
+    check(coli_v41_engram_hash_ids(span_hashes, 0, classes, 2, NULL, 0, 2) == 0,
+          "the span's own hash ids are computable");
+    int64_t smallest = span_hashes[0], largest = span_hashes[0];
+    for (int slot = 0; slot < 2 * hash_cols; slot++) {
+        if (span_hashes[slot] < smallest) smallest = span_hashes[slot];
+        if (span_hashes[slot] > largest) largest = span_hashes[slot];
+    }
+    check(opened && smallest >= mapped.row_count,
+          "the real hash ids fall outside the 4-row synthetic table");
+    float span_stream[2 * hc_mult * dim];
+    for (int index = 0; index < 2 * hc_mult * dim; index++)
+        span_stream[index] = original[index % (hc_mult * dim)];
+    if (opened) {
+        check(coli_v41_engram_span(span_stream, hc_mult, dim, classes, 2, NULL, 0, 2,
+                                   0, &mapped, head_dim, &wkv, weight, 1e-6f,
+                                   &work) != 0,
+              "span refuses a table that cannot hold the real hash ids");
+        check(coli_v41_engram_span(span_stream, hc_mult, dim, classes, 3, NULL, 0, 2,
+                                   0, &mapped, head_dim, &wkv, weight, 1e-6f,
+                                   &work) != 0,
+              "a span longer than the workspace was built for is refused");
+        check(coli_v41_engram_span(span_stream, hc_mult, dim, classes, 2, NULL, 0, 2,
+                                   0, &mapped, head_dim, &wkv, weight, 1e-6f,
+                                   NULL) != 0,
+              "span refuses a missing workspace");
+
+        /* routing: one non-zero weight per column group, so each projection row
+         * reads a different slice of the fetched rows */
+        ColiTensorView routed;
+        memset(&routed, 0, sizeof(routed));
+        routed.format = COLI_TENSOR_FP8_E4M3_BLOCK;
+        routed.scale_format = COLI_SCALE_F32;
+        routed.data = wkv_data;
+        routed.scales = wkv_scales;
+        routed.data_bytes = wkv_bytes;
+        routed.scale_bytes = wkv_scale_bytes;
+        routed.rows = out_rows;
+        routed.columns = hash_cols * head_dim;
+        routed.block_rows = 1;
+        routed.block_columns = 32;
+        for (size_t row = 0; row < (size_t)out_rows; row++)
+            wkv_data[row * hash_cols * head_dim + row] = 0x38;   /* 1.0 */
+        float first[hc_mult * dim], second[hc_mult * dim];
+        memcpy(first, original, sizeof(first));
+        memcpy(second, original, sizeof(second));
+        int64_t valid[hash_cols];
+        for (int index = 0; index < hash_cols; index++)
+            valid[index] = index % 4;
+        check(coli_v41_engram_apply(first, hc_mult, dim, valid, &mapped, head_dim,
+                                    &routed, weight, 1e-6f, &work) == 0,
+              "the driver runs on a non-zero projection");
+        int64_t shifted[hash_cols];
+        for (int index = 0; index < hash_cols; index++)
+            shifted[index] = (index + 1) % 4;
+        check(coli_v41_engram_apply(second, hc_mult, dim, shifted, &mapped, head_dim,
+                                    &routed, weight, 1e-6f, &work) == 0,
+              "the driver runs on the shifted hashes");
+        check(memcmp(first, second, sizeof(first)) != 0,
+              "different hash rows leave different residuals");
+        int moved = 0;
+        for (int index = 0; index < hc_mult * dim; index++)
+            if (first[index] != original[index]) moved = 1;
+        check(moved, "a non-zero projection changes the stream");
+        memset(wkv_data, 0, wkv_bytes);
+    }
+    coli_v41_engram_workspace_free(&work);
+    check(work.rows == NULL && work.projection == NULL,
+          "freeing the workspace releases its buffers");
+    check(coli_v41_engram_workspace_init(&work, 0, head_dim, hc_mult, dim, 2) != 0,
+          "an empty hash width is refused");
+    if (opened)
+        coli_v41_engram_table_close(&mapped);
+    free(wkv_data);
+    free(wkv_scales);
+    remove(path);
+}
+
 /* The n-gram hash ids, against the golden vectors generated from the verified
  * layout. These are the ids that index a 94.4 GiB table, so a single wrong bit is a
  * different model: the addressing is checked here rather than assumed, and the same
@@ -454,6 +730,8 @@ static void test_engram_compress(void) {
 }
 
 int main(void) {
+    /* unbuffered: if something crashes, the last line says where */
+    setvbuf(stdout, NULL, _IONBF, 0);
     printf("deepseek_v41 contract\n");
     test_config_shape();
     test_engram_gate();
@@ -461,6 +739,9 @@ int main(void) {
     test_router();
     test_swiglu_clamp();
     test_engram_token_map();
+    test_fp8_matvec_blocked();
+    test_engram_table_map();
+    test_engram_apply();
     test_engram_fetch();
     test_engram_contribution();
     test_engram_hash();

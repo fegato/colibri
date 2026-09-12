@@ -171,6 +171,53 @@ int coli_v41_rope_apply(float *vectors, int vector_count, int dimension,
  * so this is the derived part: token id -> compressed class, and the n-gram hash
  * ids that index a layer's table. Pinned to the reference by
  * tests/deepseek_v41_engram_vectors.h. */
+/* The engram table: two read-only mappings (weight rows and their E8M0 scales) of
+ * the same shard, plus the row count they agree on. */
+typedef struct {
+    compat_ro_map weight_map;
+    compat_ro_map scale_map;
+    const uint8_t *rows;
+    size_t rows_bytes;
+    const uint8_t *scales;
+    size_t scales_bytes;
+    int64_t row_count;
+} ColiV41EngramTable;
+
+/* Reusable per-layer buffers, so a prefill chunk allocates nothing per position. */
+typedef struct {
+    float *rows;
+    int64_t *hashes;
+    float *projection;
+    float *weight;
+    int hash_cols;
+    int head_dim;
+    int hc_mult;
+    int dim;
+    int max_positions;
+} ColiV41EngramWorkspace;
+
+int coli_v41_engram_table_open(ColiV41EngramTable *table, const char *shard_path,
+                               int64_t weight_offset, size_t weight_bytes,
+                               int64_t scale_offset, size_t scale_bytes,
+                               int head_dim, char *error, size_t error_size);
+void coli_v41_engram_table_close(ColiV41EngramTable *table);
+int coli_v41_engram_workspace_init(ColiV41EngramWorkspace *work, int hash_cols,
+                                   int head_dim, int hc_mult, int dim,
+                                   int max_positions);
+void coli_v41_engram_workspace_free(ColiV41EngramWorkspace *work);
+int coli_v41_engram_apply(float *stream, int hc_mult, int dim,
+                          const int64_t *hashes, const ColiV41EngramTable *table,
+                          int head_dim, const ColiTensorView *wkv,
+                          const float *weight, float eps,
+                          ColiV41EngramWorkspace *work);
+int coli_v41_engram_span(float *stream, int hc_mult, int dim, const int *classes,
+                         int count, const int *history, int history_count,
+                         int pad_class, int layer_position,
+                         const ColiV41EngramTable *table, int head_dim,
+                         const ColiTensorView *wkv, const float *weight, float eps,
+                         ColiV41EngramWorkspace *work);
+int coli_v41_fp8_matvec_blocked(float *output, const ColiTensorView *weight,
+                                const float *input);
 int coli_v41_engram_build_token_map(uint32_t *map, int map_count);
 uint64_t coli_v41_engram_token_map_digest(const uint32_t *map, int count);
 int coli_v41_engram_fetch_rows(float *output, const int64_t *rows, int row_count,

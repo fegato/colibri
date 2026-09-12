@@ -323,6 +323,57 @@ recorded at the top of the header.
 | the C rebuild's class count, samples and FNV-1a fingerprint | match (64 checks in `tests/test_deepseek_v41.c`) |
 | a payload that disagrees with itself (repeat before its representative, too-small buffer) | refused, not guessed |
 
+## Dense fp8 blocks: 32x32, where the V4 engine hardcodes 128
+
+Every fp8 weight in the released checkpoint is scaled in **32x32 blocks**, because
+`quantization_config.weight_block_size` is `[32, 32]`. The header read confirms it
+independently of the config: `attn.wq_a.scale` is `[40, 160]` for a `[1280, 5120]`
+weight, and `engram.wkv.scale` is `[800, 192]` for `[25600, 6144]` -- rows/32 by
+columns/32 in both cases. V4's config declares `[128, 128]`, and the engine's shared
+matvec is written for that: the 128 appears in `fp8_matvec_validate` (both the
+accepted `block_columns` and the scale size it demands), in the AVX2 tile path, in
+the activation qdq width it passes, and inside `matmul_fp8`.
+
+So the dense path is a **blocker for any V4.1 layer**: run it as-is and the engine
+would read the wrong scale for every weight it touches. The engram projection does
+not: `coli_v41_fp8_matvec_blocked` takes the geometry from the view
+(`block_columns`, and `block_rows` for the scale row), quantizes the activation over
+the same width exactly as the reference's `Linear` does before its fp8 GEMM, and is
+covered by a hand-checked case (a 1x32 block of two non-zero weights against a
+computed product, plus the width and scale-size refusals). The dense layers still
+need the same treatment, and that is the next thing that must land before the engine
+can run one V4.1 layer at all.
+
+### The table is mapped, never read, and the driver stays per position
+
+`coli_v41_engram_table_open` maps the two tensor ranges straight out of the shard with
+`compat_map_readonly` -- the same primitive the engine already uses for weights, whose
+comment describes exactly this case (pages faulted on read, reclaimable file-backed
+cache). Nothing is copied and nothing is dequantized up front, which is what makes a
+94.4 GiB table per layer a non-event: the scale bytes stay E8M0 and are decoded per
+row, because expanding them to f32 would multiply the footprint by eight for a table
+this size. The engine's own view convention for *dense* weights is the opposite (the
+loader expands E8M0 into f32 before the layer runs) -- the two are not interchangeable,
+and the table path deliberately keeps the raw bytes.
+
+`coli_v41_engram_workspace_init` owns the per-position buffers (the fetched rows, the
+hash ids, the projection, the fused `q_weight * k_weight`), and the workspace is sized
+for the longest span it may serve: `hash_ids` writes `hash_cols` entries **per
+position**, so a workspace built for one position silently overran its hash buffer on
+a two-position span. It now carries `max_positions` and `span` refuses a longer span
+instead. `coli_v41_engram_apply` does one position (hashes -> gather -> projection ->
+gate -> residue) and `coli_v41_engram_span` walks a run of classes, refusing an
+overlong span, a missing workspace, a row past the table end, and a `wkv` whose columns
+do not match the hash width.
+
+The contract test keeps the two halves apart on purpose: the gate and the gather are
+held to the reference's own classes, while the driver is held to the plumbing it alone
+owns (the split offsets, per-position routing, the fail-closed shapes). A synthetic
+4-row table cannot hold real hash ids -- they are offsets over 24 primes, millions of
+rows -- so `span` refusing it is asserted as the fail-closed property, and the routing
+is checked with a `wkv` whose rows pick different input columns: shifted hashes must
+leave different residuals.
+
 ## Port plan
 
 1. `c/family_registry.py`: `deepseek_v41` descriptor + `_dsv41_geometry` planner. **done**
@@ -352,7 +403,11 @@ recorded at the top of the header.
       `tools/v41_warning_parity.py`)
 - [x] Checkpoint contract verified from headers alone (96,085 tensors / 475.2 GiB,
       ownership sets, engram sizes) by `tools/check_deepseek_v41_checkpoint.py`
-- [ ] V4.1 config shape + fail-closed gates in the engine
+- [x] V4.1 config shape + fail-closed gates in the engine
+- [x] Engram table mapped out of the shard (no copy, E8M0 scales kept raw)
+- [x] Engram per-position driver + workspace, fail-closed on every shape
+- [ ] Dense fp8 block geometry: the engine hardcodes 128-wide blocks, the
+      checkpoint is 32 -- blocks any V4.1 layer
 - [x] Engram layout verified against the checkpoint's own numbers (token map
       classes, table rows) by `tools/make_deepseek_v41_engram.py`
 - [x] Engram hash addressing implemented in C and pinned to the *official*
