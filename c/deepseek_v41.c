@@ -12731,7 +12731,7 @@ static void v41_ckpt_disk_write(int i) {
         f = fopen(tmp, "wb");
         if (!f) return;
     }
-    static const char magic[9] = "COLIV41CK";
+    static const char magic[9] = "COLIV41C";
     int32_t head[4] = {1, slot->kind, slot->len, slot->layers};
     int ok = fwrite(magic, 8, 1, f) == 1 &&
              fwrite(&v41_ckpt_fingerprint, sizeof(v41_ckpt_fingerprint), 1, f) == 1 &&
@@ -12758,7 +12758,7 @@ static void v41_ckpt_disk_load(void) {
         if (!f) continue;
         char magic[8]; uint32_t fp = 0; int32_t head[4];
         V41PrefixCkpt *slot = &v41_ckpt_slots[i];
-        int ok = fread(magic, 8, 1, f) == 1 && !memcmp(magic, "COLIV41CK", 8) &&
+        int ok = fread(magic, 8, 1, f) == 1 && !memcmp(magic, "COLIV41C", 8) &&
                  fread(&fp, sizeof(fp), 1, f) == 1 && fp == v41_ckpt_fingerprint &&
                  fread(head, sizeof(head), 1, f) == 1 && head[0] == 1 &&
                  head[2] > 0 && head[2] < (1 << 22) && head[3] > 0 && head[3] <= 256;
