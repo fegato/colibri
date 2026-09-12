@@ -506,6 +506,25 @@ computed product, plus the width and scale-size refusals). The dense layers stil
 need the same treatment, and that is the next thing that must land before the engine
 can run one V4.1 layer at all.
 
+### Where, exactly
+
+Grepped in `deepseek_v41.c` at `0c1b504`; the line numbers drift, so each site is named too --
+and every one of them has to be read before it is changed, because an amalgamated engine keeps
+per-unit copies of the same helper and a partial sweep reads as a complete one in a diff.
+
+| what | where | count |
+| --- | --- | --- |
+| `packed_rows8 ? 8 : 128, 128` -- the per-unit builds of a view's block geometry | 2387, 2849, 3997, 4737, 6848, 7331 | 6 |
+| `fp8_view` -- the per-unit helpers that fill it in | 2369, 2831 | 2 |
+| the grouped `wo_a` view | 2650, 3057 (the grouped matvec's GPU branch, compiled out here: the row grouping itself is what has to take the new width) | 2 |
+| `v41_fp8_pack_rows8_inplace` -- V4's runtime packing, which *redefines* `block_rows` to 8 to describe its own on-disk form | 794 | 1 |
+| `coli_v41_fp8_matvec_blocked` -- the family-local matvec that already takes the geometry from the view | 1930 | the dispatch target |
+
+Two rules turn those six edits into one sweep: the packing flag is off for V4.1 (leaving it on
+tells the view a geometry the checkpoint does not have), and every site has to reach
+`coli_v41_fp8_matvec_blocked` -- a site left on the shared matvec keeps V4's 128 and says
+nothing.
+
 ### The table is mapped, never read, and the driver stays per position
 
 `coli_v41_engram_table_open` maps the two tensor ranges straight out of the shard with
