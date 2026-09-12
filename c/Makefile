@@ -1065,7 +1065,12 @@ include Makefile.deepseek-v41.units
 
 deepseek-v41: deepseek_v41$(EXE)
 
-deepseek_v41$(EXE):
+# The engine's direct includes as prerequisites, on one line: this Makefile has no
+# -MMD/-include dependency generation, so a header that is not listed here makes
+# `make` report success while leaving a stale binary. tests/test_makefile_deps.py
+# enforces the list against the source, and it folds line continuations with a bare
+# backslash-newline -- on these CRLF files a wrapped list would be invisible to it.
+deepseek_v41$(EXE): deepseek_v41.c backend_cuda_dsv4.h deepseek_v41_bank_pair.h deepseek_v41_dspark.inc deepseek_v41_engram_tables.h deepseek_v41_engram_tokens.h deepseek_v41_expert_store_registry.h deepseek_v41_hybrid.h deepseek_v41_internal.h edge_adapters.h edge_runtime.h edge_tok_internal.h hyper_connections.h json.h native_quant.h native_quant_batch.h native_quant_dual.h native_quant_fp4_rows16.h quant.h route_trace.h segment_adapter_internal.h segment_adapters.h serve_codec.h tok.h Makefile.deepseek-v41 Makefile.deepseek-v41.units
 	$(MAKE) -f Makefile.deepseek-v41 ARCH=$(ARCH) deepseek-v41
 
 deepseek-v41-objs:
@@ -1090,10 +1095,11 @@ tests/test_deepseek_v41$(EXE): tests/test_deepseek_v41.c deepseek_v41.c deepseek
 	$(CC) $(CFLAGS) -DCOLI_V41_TEST_HOOKS $< $(V41_TEST_LINK_OBJS) \
 		-o $@ -pthread $(LDFLAGS)
 else
-deepseek-v41:
-	@echo "deepseek-v41: not built on this host; deepseek_v41_portable.c is the fail-closed artifact" >&2
-
-deepseek_v41$(EXE): deepseek_v41_portable.c
+# No `deepseek_v41$(EXE):` rule here on purpose: the artifact has one name but two
+# ways to be made, and a second rule for the same file target would shadow the real
+# engine rule in tests/test_makefile_deps.py, which reads the Makefile as text.
+deepseek-v41: deepseek_v41_portable.c
+	@echo "deepseek-v41: this host has no supported tier; building the fail-closed artifact" >&2
 	$(CC) $(NOCUDA_CFLAGS) deepseek_v41_portable.c -o deepseek_v41$(EXE) $(NOCUDA_LDFLAGS)
 
 deepseek-v41-objs:
@@ -1914,7 +1920,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) $(if $(filter 1,$(COLI_V41_SUPPORTED)),deepseek_v41$(EXE),) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
