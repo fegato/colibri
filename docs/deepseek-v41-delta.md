@@ -421,6 +421,11 @@ leave different residuals.
 - [x] Engram per-position driver + workspace, fail-closed on every shape
 - [ ] Dense fp8 block geometry: the engine hardcodes 128-wide blocks, the
       checkpoint is 32 -- blocks any V4.1 layer
+- [x] Verified on Linux as well as Windows: from a clean clone of the pushed commit,
+      on gcc 15.2 / Ubuntu 26.04, the engine builds (0 errors), the contract test
+      passes 110/110 checks with 0 warnings of its own, the registry test passes
+      48/48, and the fork adds no warning over the V4 base unit by unit
+      (`c/tools/v41_warning_parity.py`: 5 and 5, 0 units differing)
 - [x] Engram layout verified against the checkpoint's own numbers (token map
       classes, table rows) by `tools/make_deepseek_v41_engram.py`
 - [x] Engram hash addressing implemented in C and pinned to the *official*
