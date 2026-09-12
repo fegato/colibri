@@ -458,6 +458,23 @@ COLI_V4_SUPPORTED := 1
 endif
 endif
 
+# DeepSeek V4.1-Flash: an amalgamated engine forked from the V4 engine
+# (tools/fork_deepseek_v41.py; deltas in docs/deepseek-v41-delta.md), so it
+# rides the same host matrix. Everywhere else deepseek_v41_portable.c is built:
+# a fail-closed artifact that refuses to run, because V4.1 through the V4 engine
+# would compute a different model.
+COLI_V41_SUPPORTED :=
+ifneq (,$(X86_64))
+ifneq (,$(IS_WIN)$(LINUX))
+COLI_V41_SUPPORTED := 1
+endif
+endif
+ifneq (,$(AARCH64))
+ifneq (,$(LINUX)$(DARWIN))
+COLI_V41_SUPPORTED := 1
+endif
+endif
+
 # Gates are exactly the tests that have a build rule further down -- derived from those
 # rules, so adding a gate means adding your tests/test_*.c and its rule, and nothing else.
 # There is no shared list to conflict on.
@@ -473,12 +490,16 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
+	test_deepseek_v41 \
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
+# V41 DELTA: tests/test_deepseek_v41.c lands with the config/routing deltas; the
+# rule below is already here so `make tests/test_deepseek_v41` works the moment the
+# file is added, and this block moves the test into the gate list at that point.
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
@@ -1035,12 +1056,57 @@ qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h st.h json.h compat.
 qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
 	$(CC) $(NOCUDA_CFLAGS) qwen38.c -o qwen38$(EXE) $(NOCUDA_LDFLAGS)
 
-# deepseek_v41.c is a fail-closed stub until the V4.1 port lands
-# (docs/deepseek-v41-delta.md): it builds everywhere and refuses to run,
-# so the registry/build/release/site contracts stay green without ever
-# computing the wrong model.
-deepseek_v41$(EXE): deepseek_v41.c
-	$(CC) $(NOCUDA_CFLAGS) deepseek_v41.c -o deepseek_v41$(EXE) $(NOCUDA_LDFLAGS)
+# DeepSeek V4.1-Flash engine.  Its own makefile owns the units (the engine is
+# amalgamated: one .c, compiled once per -DCOLI_V41_UNIT_* object) exactly like
+# the V4 engine's; the parent only decides whether the host can build it.
+.PHONY: deepseek-v41 deepseek-v41-objs deepseek-v41-clean
+ifeq ($(COLI_V41_SUPPORTED),1)
+include Makefile.deepseek-v41.units
+
+deepseek-v41: deepseek_v41$(EXE)
+
+deepseek_v41$(EXE):
+	$(MAKE) -f Makefile.deepseek-v41 ARCH=$(ARCH) deepseek-v41
+
+deepseek-v41-objs:
+	$(MAKE) -f Makefile.deepseek-v41 ARCH=$(ARCH) deepseek-v41-objs
+
+deepseek-v41-clean:
+	$(MAKE) -f Makefile.deepseek-v41 deepseek-v41-clean
+
+# Engine contract test: config shape, routing, the fail-closed capability gates.
+# It links CPU units only -- the V4.1 CUDA tier does not exist yet and must not
+# be resolved through the V4 one (Makefile.deepseek-v41 has the reasoning).
+V41_TEST_LINK_OBJS = \
+	COLI_V41_UNIT_ST.o \
+	COLI_V41_UNIT_CONFIG.o \
+	COLI_V41_UNIT_MATH.o \
+	COLI_V41_UNIT_SPARSE_ATTENTION.o \
+	COLI_V41_UNIT_RESOURCE_PLAN.o \
+	COLI_V41_UNIT_PROMPT.o \
+	COLI_V41_UNIT_EXPERT_ROWS16.o \
+	COLI_V41_UNIT_NATIVE_QUANT.o \
+	COLI_V41_UNIT_NATIVE_QUANT_DUAL.o \
+	COLI_V41_UNIT_NATIVE_QUANT_ROWS16.o
+
+tests/test_deepseek_v41$(EXE): tests/test_deepseek_v41.c deepseek_v41.c deepseek_v41.h \
+		Makefile.deepseek-v41.units Makefile.deepseek-v41
+	$(MAKE) -f Makefile.deepseek-v41 ARCH=$(ARCH) $(V41_TEST_LINK_OBJS)
+	$(CC) $(CFLAGS) -DCOLI_V41_TEST_HOOKS $< $(V41_TEST_LINK_OBJS) \
+		-o $@ -pthread $(LDFLAGS)
+else
+deepseek-v41:
+	@echo "deepseek-v41: not built on this host; deepseek_v41_portable.c is the fail-closed artifact" >&2
+
+deepseek_v41$(EXE): deepseek_v41_portable.c
+	$(CC) $(NOCUDA_CFLAGS) deepseek_v41_portable.c -o deepseek_v41$(EXE) $(NOCUDA_LDFLAGS)
+
+deepseek-v41-objs:
+	@:
+
+deepseek-v41-clean:
+	rm -f deepseek_v41$(EXE)
+endif
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:
