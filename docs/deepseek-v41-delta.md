@@ -119,6 +119,82 @@ lands — never on an assumption:
 | CUDA tier | always, for now | V4.1 on the V4 tier (`coli_cuda_dsv4*.dll`) would upload V4.1 weights into V4 maths; `COLI_V4_GPU_TIER` is deliberately left undefined |
 | prefix checkpoint | snapshot magic | V4.1 writes `COLIV41C`, V4 writes `COLIV4CK`: a V4 snapshot can never resume a V4.1 session |
 
+## Verified checkpoint facts (headers read, no weights)
+
+`tools/check_deepseek_v41_checkpoint.py` validates a checkpoint against the
+engine's contract from the safetensors headers alone: `--from-hf` pulls ~2 MB and
+takes a minute, `--headers-json` runs offline (what CI can use), `--model` reads a
+local tree. Against the released checkpoint it reports **96,085 tensors /
+475.2 GiB** -- the index's `metadata.total_size` matches the header sums byte for
+byte -- and the contract passes.
+
+Byte budget the planner has to live with:
+
+| family | size | note |
+| --- | --- | --- |
+| routed experts (fp4 packed as I8) | 253.1 GiB | 84.4 GiB per projection, + 15.8 GiB of E8M0 scales |
+| engram tables | 188.8 GiB | **two tables, 94.4 GiB each** |
+| DSpark experts | 6.3 GiB + 0.4 scales | 128 experts top-3 across three stages |
+| attention dense (fp8) | ~10 GiB | wq_b/wo_b 1.56 GiB each, wo_a 1.25, wq_a 0.24 |
+| vision tower + aligner | ~2.3 GiB | text-only runs ignore it |
+| embed / head | 2.5 GiB | untied |
+
+Shapes that decide the port:
+
+- `engram.embed.weight` is F8_E4M3 `[384006168, 256]` with an E8M0 scale per 32
+  columns `[rows, 8]`: **94.4 GiB per engram layer, 40% of the model**, touched as
+  ~24 rows per token per layer ((max_ngram_size - 1) x n_heads). It cannot be
+  resident -- mmap it and let the page cache hold the rows a conversation touches,
+  exactly the pattern AirLLM uses for Qwen3.8's n-gram table. Unlike routed
+  experts the addresses are **token-deterministic** (they depend only on token
+  ids), so a whole prompt's rows can be prefetched before the layer runs.
+- `engram.{q,k}_weight` BF16 `[4, 5120]`, `engram.wkv` fp8 `[25600, 6144]`
+  = `[5 x hidden, hidden + o_lora_rank]`.
+- experts are packed fp4 in **I8** (`[moe, hidden/2]` for w1/w3, `[hidden, moe/2]`
+  for w2) with per-32 E8M0 scales; dense weights are fp8-e4m3 with 32x32 UE8M0
+  scales. Indexer, compressor and index-K are **BF16** in the checkpoint and
+  quantized at runtime -- and with two different regimes: compressed KV is fp4 in
+  groups of 16 with **E4M3** scales, index K fp4 in groups of 32 with **E8M0**.
+- ownership, confirmed layer by layer: `compressor.wkv/norm` and
+  `indexer.wk/k_norm` on `kv_source_layer_ids [2,8,14,20]`; `indexer.wq_b` +
+  `weights_proj` on the eight `index_source_layer_ids`; `compressor.wgate` **only**
+  where the compress ratio is 2 (layers 2, 8, 14 -- layer 20 has ratio 1); `engram.*`
+  on `[1, 14]`; `attn_sink`/`q_norm`/`kv_norm`/`gate.bias_vl` on all 40 layers.
+- `compress_ratios` is 43 long for 40 backbone + 3 DSpark layers: `0` for layers
+  0-1 (pure sliding window, base rope), `2` for 2-19, `1` for 20-39, `0` for the
+  three DSpark layers -- which is why they carry no compressor and no indexer.
+- DSpark stages are **heterogeneous**: stage 0 owns `main_proj` fp8 `[5120, 15360]`
+  and `main_norm` (15360 = 3 x hidden: the three target layers' captured hidden
+  states), the last stage owns `markov_head.embed`/`head` BF16 `[129280, 256]`,
+  `confidence_head.proj` BF16 `[1, 5376]` (5376 = hidden + markov_rank) and `norm`.
+  Assuming three identical draft layers is the port bug this asserts against.
+- vision: `patch_embed` `[1024, 14*14*3]`, MLP `w1` is the **fused gate+up**
+  `[5632, 1024]` = 2 x `intermediate_size`, `w2` `[1024, 2816]`, `aligner.w1`
+  `[5120, 9216]` = hidden x (1024 x 3x3) for `downsample_ratio: 3`.
+- **zero `tid2eid` tensors**: V4.1 dropped V4's token-id hash routing, so its config
+  has no `num_hash_layers` while the V4 parser *requires* that key -- a config-shape
+  delta, not a footnote.
+
+## Shared KV / index: the exact mechanism
+
+From the reference (`ref:500-580`, `ref:722-778`):
+
+- `kv_source_layers` own the compressor and publish `compress_kv` + `index_k`; every
+  other layer reads them. `compress_ratio > 0` does not make a layer an owner.
+- `index_source_layers` run an indexer and publish `topk_idxs`; the layers between
+  two sources reuse the published result instead of scoring again.
+- two-level top-k: only `candidate_source_layer_id` (20) computes level-1 candidate
+  blocks (2048 blocks of 8 positions, block score = its best position, newest partly
+  filled block pinned in), and only layers *after* it mask their own scores by those
+  blocks; earlier source layers do a plain global top-k.
+- visibility: a compressed position is visible to a query only once the query has
+  passed its last token -- the per-token mask a batched prefill needs. Pulsar reports
+  the same trap on V4 (batched prefill decaying to single-token steps once the
+  indexer engages).
+- RoPE on compressed latents: group `j` is rotated at position `j * ratio`, with YaRN
+  and `compress_rope_theta` when the ratio is non-zero, base `rope_theta` and no YaRN
+  for the ratio-0 layers.
+
 ## Port plan
 
 1. `c/family_registry.py`: `deepseek_v41` descriptor + `_dsv41_geometry` planner. **done**
@@ -146,6 +222,8 @@ lands — never on an assumption:
 - [x] Engine fork + build wiring; CPU-only build verified with mingw-w64 gcc 16.2
       (27 units, LTO; warning profile identical to a tier-less V4 build, checked by
       `tools/v41_warning_parity.py`)
+- [x] Checkpoint contract verified from headers alone (96,085 tensors / 475.2 GiB,
+      ownership sets, engram sizes) by `tools/check_deepseek_v41_checkpoint.py`
 - [ ] V4.1 config shape + fail-closed gates in the engine
 - [ ] Shared KV/index, engram, DSpark
 - [ ] Tiny oracle 32/32
