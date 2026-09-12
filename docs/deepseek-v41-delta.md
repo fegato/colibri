@@ -175,6 +175,32 @@ Shapes that decide the port:
   has no `num_hash_layers` while the V4 parser *requires* that key -- a config-shape
   delta, not a footnote.
 
+## The experts, read from the vendor's own converter
+
+The routed experts ship as fp4 with **per-row scales over 32-wide blocks along K** -- the
+shape rule is stated as an assertion in the released `inference/convert.py`:
+
+```python
+assert scale.size(0) == out_dim and scale.size(1) == in_dim // fp4_block_size   # 32
+```
+
+so `layers.0.ffn.experts.0.w1.scale` `[2304, 160]` is a `[2304, 5120]` weight and
+`...w2.scale` `[5120, 72]` is `[5120, 2304]`: `moe_intermediate_size` is 2304, not the 73728
+the shapes suggest when read the wrong way round. Their converter then casts the fp4 payload
+into **fp8 e4m3** with the fp4 range folded into the scale (`cast_e2m1fn_to_e4m3fn`: a
+per-block offset, `scale_max_offset_bits = scale.amax / 2**MAX_OFFSET_BITS`, re-expanded over
+32), which is what lets the experts travel through an fp8 GEMM at the same 32-block geometry
+as the dense weights.
+
+Two consequences for the port:
+
+- The 32x32 block geometry is not only the dense path's problem: it is the export format of
+  the experts too, so one fix covers both and the fp4-specific machinery is avoidable if the
+  loader performs the vendor's own cast.
+- "Native load, no converter" stays true about *names and layout* -- but the experts do need
+  this documented fp4-to-fp8 cast at load time. It is a transformation, not an external tool,
+  and the delta doc should say so rather than let the earlier wording stand.
+
 ## Shared KV / index: the exact mechanism
 
 From the reference (`ref:500-580`, `ref:722-778`):
