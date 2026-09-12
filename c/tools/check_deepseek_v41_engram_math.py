@@ -14,7 +14,13 @@ does. This tool runs the reference's own classes instead, extracted verbatim fro
                                            engine's shared fp8 matvec, covered by
                                            the V4 tests)
 
-    python tools/check_deepseek_v41_engram_math.py --probe ./engram_math_probe
+Build the probe into build/ (already gitignored -- never leave a binary in the
+tree) and point the tool at it:
+
+    gcc -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O2 -I. tests/engram_math_probe.c \
+        COLI_V41_UNIT_ENGRAM.o COLI_V41_UNIT_NATIVE_QUANT.o \
+        -o build/engram_math_probe -lm
+    python tools/check_deepseek_v41_engram_math.py --probe build/engram_math_probe
 """
 from __future__ import annotations
 
