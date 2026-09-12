@@ -334,6 +334,19 @@ matvec is written for that: the 128 appears in `fp8_matvec_validate` (both the
 accepted `block_columns` and the scale size it demands), in the AVX2 tile path, in
 the activation qdq width it passes, and inside `matmul_fp8`.
 
+The reference settles both sides in one line, and names the activation explicitly:
+
+```python
+fp8_block_size = 32  # one fp8 scale per 32x32 weight block / 32 activations
+```
+
+It is the constant behind `act_quant(x, fp8_block_size, ...)` **and** the `block_size`
+handed to `fp8_gemm`, so V4.1 quantizes the *activations* in 32-wide blocks too -- the
+engine's 128 is wrong on that side as well, not only for the weight scales. The engram
+table's geometry is the same constant: `ParallelEngramEmbedding` dequantizes with
+`values.unflatten(-1, (-1, self.block_size))`, which is why the checkpoint stores 8
+E8M0 scales for a 256-wide row.
+
 So the dense path is a **blocker for any V4.1 layer**: run it as-is and the engine
 would read the wrong scale for every weight it touches. The engram projection does
 not: `coli_v41_fp8_matvec_blocked` takes the geometry from the view
