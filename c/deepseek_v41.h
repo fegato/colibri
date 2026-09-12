@@ -41,6 +41,13 @@ typedef struct {
     int dspark_markov_rank;
     int hc_mult;
     int hc_sinkhorn_iters;
+    /* quantization_config.weight_block_size: the fp8 block every scale tensor in the
+     * checkpoint is shaped by. V4.1 is 32x32 (every scale is [rows/32, columns/32]),
+     * where the engine's shared dense path was written for V4's 128. Read here and
+     * refused below unless it is the verified geometry: a different width would make
+     * a layer read the wrong scale without saying so. */
+    int fp8_block_rows;
+    int fp8_block_columns;
     int vocab_size;
     int max_position_embeddings;
     int original_max_position_embeddings;

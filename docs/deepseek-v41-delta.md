@@ -347,6 +347,13 @@ table's geometry is the same constant: `ParallelEngramEmbedding` dequantizes wit
 `values.unflatten(-1, (-1, self.block_size))`, which is why the checkpoint stores 8
 E8M0 scales for a 256-wide row.
 
+The config now carries it rather than assuming it: `weight_block_size` is read from the
+checkpoint into `fp8_block_rows`/`fp8_block_columns`, and any width but the verified 32 is
+refused at parse time with the reason spelled out -- the vectorized matvec and the loader
+still hardcode V4's 128, so accepting 128 here would dequantize every dense weight with the
+wrong scale and say nothing. The gate goes away with the loader and the matvec taking the
+width from the view.
+
 So the dense path is a **blocker for any V4.1 layer**: run it as-is and the engine
 would read the wrong scale for every weight it touches. The engram projection does
 not: `coli_v41_fp8_matvec_blocked` takes the geometry from the view

@@ -16397,6 +16397,29 @@ int coli_v41_config_parse(ColiDeepSeekV41Config *config, const char *json,
         free(arena);
         return -1;
     }
+    /* The fp8 block geometry, from the checkpoint rather than from an assumption.
+     * Anything but the verified 32x32 is refused: the vectorized matvec and the
+     * loader still hardcode V4's 128, so another width would dequantize with the
+     * wrong scale and say nothing -- docs/deepseek-v41-delta.md. */
+    {
+        jval *block = json_get(quantization, "weight_block_size");
+        if (!block || block->t != J_ARR || block->len != 2 ||
+            json_int_value(block->kids[0], &config->fp8_block_rows) != 0 ||
+            json_int_value(block->kids[1], &config->fp8_block_columns) != 0) {
+            json_free(root);
+            free(arena);
+            return set_error(error, error_size,
+                             "missing or malformed quantization_config.weight_block_size");
+        }
+        if (config->fp8_block_rows != 32 || config->fp8_block_columns != 32) {
+            json_free(root);
+            free(arena);
+            return set_error(error, error_size,
+                             "unsupported fp8 block geometry: V4.1 scales in 32x32 "
+                             "blocks, and this engine's dense path still assumes V4's "
+                             "128 -- a layer would read the wrong scale");
+        }
+    }
     if (config->hidden_size < 1 || config->num_hidden_layers < 1 ||
         config->num_attention_heads < 1 || config->n_routed_experts < 1 ||
         config->num_experts_per_tok < 1 ||

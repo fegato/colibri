@@ -200,6 +200,23 @@ static void test_source_table_validation(void) {
     check(parse(flat_quant, &config, error, sizeof(error)) != 0,
           "a non-ue8m0 scale format refused");
     free(flat_quant);
+
+    /* The fp8 block geometry is read from the checkpoint and anything but the
+     * verified 32x32 is refused: V4 scales in 128-wide blocks, and the dense path
+     * still assumes V4's -- so a different width would read the wrong scale. */
+    check(parse(json, &config, error, sizeof(error)) == 0 &&
+          config.fp8_block_rows == 32 && config.fp8_block_columns == 32,
+          "the config carries the checkpoint's fp8 block geometry (32x32)");
+    char *wide = rewrite(json, "\"weight_block_size\":[32,32]",
+                         "\"weight_block_size\":[128,128]");
+    check(parse(wide, &config, error, sizeof(error)) != 0 &&
+          strstr(error, "block geometry") != NULL,
+          "a 128-wide fp8 block geometry is refused, not silently mis-dequantized");
+    free(wide);
+    char *absent = rewrite(json, "\"weight_block_size\":[32,32],", "");
+    check(parse(absent, &config, error, sizeof(error)) != 0,
+          "a missing weight_block_size is refused");
+    free(absent);
     free(json);
 }
 
