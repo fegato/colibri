@@ -267,6 +267,24 @@ runs, unlike routed experts.
 6. `h + gate * value`, cast back to the stream's dtype. A token mask forces the
    gate to 0, which is what makes an image span pass through untouched.
 
+### The two pieces implemented so far, held to the reference
+
+`tests/engram_math_probe.c` prints its inputs and outputs, and
+`tools/check_deepseek_v41_engram_math.py` rebuilds the reference from what it reads
+-- extracting `Linear`, `ParallelEngramEmbedding` and `Engram` verbatim from the
+reference model and running them under torch:
+
+| piece | comparison | result |
+| --- | --- | --- |
+| row gather + fp8/E8M0 dequant | vs `ParallelEngramEmbedding.forward` | max delta **0** in fp32, identical after its bf16 rounding |
+| gate maths (`rstd`, signed-sqrt sigmoid, per-copy) | vs `Engram.forward`, with the projection injected | max delta **1.2e-07** (reduction order) |
+
+The projection itself is the engine's shared fp8 matvec, not new code. Both pieces
+are also covered by hand-derived cases in `tests/test_deepseek_v41.c` (80 checks),
+including the fail-closed edges: a hash row past the end of the mapping, a negative
+row id, a `head_dim` that is not a multiple of 32, a negative eps, an empty hc
+count.
+
 Consequence for the port: the 94.4 GiB per layer is *gathered*, 24 rows per token,
 and the working set of an interactive session is a few tens of MB of rows -- so the
 tables are memory-mapped and left to the page cache, never loaded, never LRU-managed
@@ -341,5 +359,7 @@ recorded at the top of the header.
       implementation (prefill and decode), `COLI_V41_UNIT_ENGRAM`
 - [x] Token map storage decided by measurement and rebuilt in C, byte-identical to
       the reference's map
+- [x] Engram row gather/dequant and the gate maths in C, verified against the
+      reference's own classes (max delta 0 and 1.2e-07)
 - [ ] Shared KV/index, engram path, DSpark
 - [ ] Tiny oracle 32/32

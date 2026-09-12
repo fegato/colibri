@@ -173,6 +173,13 @@ int coli_v41_rope_apply(float *vectors, int vector_count, int dimension,
  * tests/deepseek_v41_engram_vectors.h. */
 int coli_v41_engram_build_token_map(uint32_t *map, int map_count);
 uint64_t coli_v41_engram_token_map_digest(const uint32_t *map, int count);
+int coli_v41_engram_fetch_rows(float *output, const int64_t *rows, int row_count,
+                               int head_dim, const uint8_t *table,
+                               size_t table_bytes, const uint8_t *scale_table,
+                               size_t scale_bytes);
+int coli_v41_engram_gate(float *output, const float *stream, const float *key,
+                         const float *value, const float *weight, int hc_mult,
+                         int dim, float eps);
 int coli_v41_engram_layer_position(int layer_id);
 int coli_v41_engram_compress(int *classes, const int *ids, int count,
                              const uint32_t *token_map, int map_count, int dead);

@@ -1081,7 +1081,8 @@ V41_TEST_LINK_OBJS = \
 	COLI_V41_UNIT_ST.o \
 	COLI_V41_UNIT_CONFIG.o \
 	COLI_V41_UNIT_MATH.o \
-	COLI_V41_UNIT_ENGRAM.o
+	COLI_V41_UNIT_ENGRAM.o \
+	COLI_V41_UNIT_NATIVE_QUANT.o
 
 tests/test_deepseek_v41$(EXE): tests/test_deepseek_v41.c deepseek_v41.c deepseek_v41.h \
 		Makefile.deepseek-v41.units Makefile.deepseek-v41

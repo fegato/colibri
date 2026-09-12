@@ -1749,6 +1749,10 @@ int coli_v41_swiglu(float *output, const float *gate, const float *up,
  * ------------------------------------------------------------------------- */
 #include "deepseek_v41_engram_tables.h"
 #include "deepseek_v41_engram_tokens.h"
+#include "native_quant.h"
+
+#include <math.h>
+#include <string.h>
 
 /* A position that takes no part in an n-gram (an image span), like the reference's
  * NgramHashState.DEAD. */
@@ -1811,6 +1815,100 @@ uint64_t coli_v41_engram_token_map_digest(const uint32_t *map, int count) {
         }
     }
     return digest;
+}
+
+/* ---- table rows ---------------------------------------------------------- */
+
+/* Fetch `row_count` rows of an engram table and dequantize them to float, exactly
+ * as the reference's ParallelEngramEmbedding does: a row is `head_dim` fp8 bytes
+ * plus one E8M0 exponent per 32 columns, and
+ *
+ *     value(row, column) = e4m3(R[row][column]) * 2^(scale[row][column / 32] - 127)
+ *
+ * `table`/`scale_table` are the raw mapped bytes of the layer's embed.weight and
+ * embed.scale. The row ids are hash ids, i.e. attacker-reachable through the
+ * tokenizer, so every row is bounds-checked: a row that does not fit is refused
+ * instead of reading past the mapping.
+ *
+ * Output is row_count * head_dim floats. */
+int coli_v41_engram_fetch_rows(float *output, const int64_t *rows, int row_count,
+                               int head_dim, const uint8_t *table,
+                               size_t table_bytes, const uint8_t *scale_table,
+                               size_t scale_bytes) {
+    if (!output || !rows || row_count < 0 || head_dim < 32 ||
+        (head_dim % 32) != 0 || (row_count > 0 && (!table || !scale_table)))
+        return -1;
+    size_t row_bytes = (size_t)head_dim;
+    size_t scale_row_bytes = (size_t)head_dim / 32;
+    for (int row = 0; row < row_count; row++) {
+        int64_t index = rows[row];
+        if (index < 0)
+            return -1;
+        size_t offset = (size_t)index * row_bytes;
+        size_t scale_offset = (size_t)index * scale_row_bytes;
+        if (offset > table_bytes || row_bytes > table_bytes - offset ||
+            scale_offset > scale_bytes || scale_row_bytes > scale_bytes - scale_offset)
+            return -1;
+        const uint8_t *values = table + offset;
+        const uint8_t *scales = scale_table + scale_offset;
+        float *destination = output + (size_t)row * (size_t)head_dim;
+        for (int column = 0; column < head_dim; column++) {
+            float scale = coli_e8m0_decode(scales[column / 32]);
+            destination[column] = coli_e4m3fn_decode(values[column]) * scale;
+        }
+    }
+    return 0;
+}
+
+/* ---- the gate ------------------------------------------------------------ */
+
+/* Write one position's engram contribution into `output`, which is the stream's
+ * hc copies: [hc_mult][dim].
+ *
+ * The reference computes, per (position, hc copy) and over `dim` -- not jointly:
+ *
+ *     rstd = rsqrt(mean(h^2) + eps) * rsqrt(mean(key^2) + eps)
+ *     dot  = sum(h * weight * key) * rstd * dim^-0.5
+ *     gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot))
+ *     out  = h + gate * value
+ *
+ * `weight` is `q_weight * k_weight` (the reference only ever uses their product),
+ * so it is the caller's one-time product. `key` is [hc_mult][dim], `value` [dim]
+ * and shared by every copy -- which is why the engram adds one direction to the
+ * stream rather than one per copy. */
+int coli_v41_engram_gate(float *output, const float *stream, const float *key,
+                         const float *value, const float *weight, int hc_mult,
+                         int dim, float eps) {
+    if (!output || !stream || !key || !value || !weight || hc_mult < 1 || dim < 1 ||
+        !(eps >= 0.0f))
+        return -1;
+    float inverse_dimension = 1.0f / sqrtf((float)dim);
+    for (int copy = 0; copy < hc_mult; copy++) {
+        const float *h = stream + (size_t)copy * (size_t)dim;
+        const float *k = key + (size_t)copy * (size_t)dim;
+        const float *w = weight + (size_t)copy * (size_t)dim;
+        float h_square = 0.0f, k_square = 0.0f, dot = 0.0f;
+        for (int column = 0; column < dim; column++) {
+            h_square += h[column] * h[column];
+            k_square += k[column] * k[column];
+            dot += h[column] * w[column] * k[column];
+        }
+        float mean_h = h_square / (float)dim;
+        float mean_k = k_square / (float)dim;
+        float rstd = (1.0f / sqrtf(mean_h + eps)) * (1.0f / sqrtf(mean_k + eps));
+        dot = dot * rstd * inverse_dimension;
+        /* a signed square root before the sigmoid, matching the training kernel */
+        float magnitude = fabsf(dot);
+        if (magnitude < 1e-6f)
+            magnitude = 1e-6f;
+        float rooted = sqrtf(magnitude);
+        float signed_root = dot < 0.0f ? -rooted : rooted;
+        float gate = 1.0f / (1.0f + expf(-signed_root));
+        float *destination = output + (size_t)copy * (size_t)dim;
+        for (int column = 0; column < dim; column++)
+            destination[column] = h[column] + gate * value[column];
+    }
+    return 0;
 }
 
 int coli_v41_engram_layer_position(int layer_id) {

@@ -261,6 +261,98 @@ static void test_swiglu_clamp(void) {
 }
 
 
+
+/* Row fetch and dequantization, on bytes whose values are stated by hand:
+ * E4M3 0x38 = 1.0, 0x40 = 2.0, 0x30 = 0.5, 0x00 = 0.0; E8M0 128 = 2, 126 = 0.5,
+ * 127 = 1. A row is head_dim fp8 bytes plus one E8M0 exponent per 32 columns. */
+static void test_engram_fetch(void) {
+    enum { head_dim = 32, rows = 2 };
+    uint8_t table[rows * head_dim];
+    uint8_t scales[rows];
+    memset(table, 0, sizeof(table));
+    table[0] = 0x38; table[1] = 0x40; table[2] = 0x30; table[3] = 0x00;
+    table[head_dim + 0] = 0x38; table[head_dim + 1] = 0x40;
+    scales[0] = 128;   /* 2.0  */
+    scales[1] = 126;   /* 0.5  */
+    float output[rows * head_dim];
+    const int64_t order[rows] = {0, 1};
+    check(coli_v41_engram_fetch_rows(output, order, rows, head_dim, table,
+                                     sizeof(table), scales, sizeof(scales)) == 0,
+          "fetch_rows reads a well-formed table");
+    check(output[0] == 2.0f && output[1] == 4.0f && output[2] == 1.0f &&
+          output[3] == 0.0f,
+          "row 0 dequantizes with its own E8M0 exponent");
+    check(output[head_dim] == 0.5f && output[head_dim + 1] == 1.0f &&
+          output[3 + head_dim] == 0.0f,
+          "row 1 uses its own exponent");
+    /* hash ids are reachable from the tokenizer, so a row that does not fit must be
+     * refused rather than read past the mapping */
+    const int64_t outside[1] = {rows};
+    check(coli_v41_engram_fetch_rows(output, outside, 1, head_dim, table,
+                                     sizeof(table), scales, sizeof(scales)) != 0,
+          "a row past the end of the table is refused");
+    const int64_t negative[1] = {-1};
+    check(coli_v41_engram_fetch_rows(output, negative, 1, head_dim, table,
+                                     sizeof(table), scales, sizeof(scales)) != 0,
+          "a negative row id is refused");
+    check(coli_v41_engram_fetch_rows(output, order, rows, 16, table, sizeof(table),
+                                     scales, sizeof(scales)) != 0,
+          "a head_dim that is not a multiple of 32 is refused");
+    /* the row that fits exactly at the end is still accepted */
+    const int64_t last[1] = {rows - 1};
+    check(coli_v41_engram_fetch_rows(output, last, 1, head_dim, table,
+                                     sizeof(table) - 1, scales, sizeof(scales)) != 0,
+          "a row that runs past the mapping is refused");
+}
+
+/* The gate, against values worked out by hand.
+ * h = [1, 0], key = [1, 0], weight = [1, 1], dim = 2, eps = 0, value = [10, -4]:
+ *   mean(h^2) = 0.5, mean(key^2) = 0.5 -> rstd = 2
+ *   dot = (1*1*1 + 0) * 2 * 2^-0.5 = 1.41421356
+ *   gate = sigmoid(sqrt(1.41421356)) = sigmoid(1.18920712) = 0.7666
+ *   out = [1 + 0.7666*10, 0 - 0.7666*4] = [8.6660, -3.0664]
+ * The tolerance is 1e-3: the hand derivation is good to four digits, and any real
+ * mistake in the formula moves these numbers far further than that.
+ * The same dot negated must give a gate below 0.5 (the signed root). */
+static void test_engram_contribution(void) {
+    const float stream[2] = {1.0f, 0.0f};
+    const float key[2] = {1.0f, 0.0f};
+    const float weight[2] = {1.0f, 1.0f};
+    const float value[2] = {10.0f, -4.0f};
+    float output[2] = {0.0f, 0.0f};
+    check(coli_v41_engram_gate(output, stream, key, value, weight, 1, 2, 0.0f) == 0,
+          "gate runs");
+    check(fabsf(output[0] - 8.6660f) < 1e-3f && fabsf(output[1] + 3.0664f) < 1e-3f,
+          "gate matches the hand-computed contribution");
+    check(output[0] < 1.0f + 10.0f && output[1] > -4.0f,
+          "the gate is inside (0,1), so the contribution is bounded by value");
+
+    /* the sign of dot decides which side of 0.5 the gate lands on */
+    const float flipped[2] = {-1.0f, 0.0f};
+    float negative[2] = {0.0f, 0.0f};
+    check(coli_v41_engram_gate(negative, stream, flipped, value, weight, 1, 2, 0.0f) == 0,
+          "gate runs with a negated key");
+    check(negative[0] < output[0],
+          "a negated dot produces a smaller gate (signed square root)");
+
+    /* several hc copies: each gets its own gate, all share one value */
+    const float stream_hc[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    const float key_hc[4] = {1.0f, 0.0f, 1.0f, 0.0f};
+    const float weight_hc[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float copies[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    check(coli_v41_engram_gate(copies, stream_hc, key_hc, value, weight_hc, 2, 2, 0.0f) == 0,
+          "gate runs per hc copy");
+    /* copy 1 has h = [0, 1] against key = [1, 0]: dot is 0, the magnitude clamps to
+     * 1e-6, so its gate is sigmoid(0.001) = 0.50025 and the two copies must differ */
+    check(fabsf(copies[0] - 8.6660f) < 1e-3f && fabsf(copies[2] - 5.0025f) < 1e-3f &&
+          fabsf(copies[3] + 1.0010f) < 1e-3f,
+          "each hc copy is gated on its own dot, sharing one value");
+    check(coli_v41_engram_gate(copies, stream_hc, key_hc, value, weight_hc, 0, 2, 0.0f) != 0,
+          "gate refuses an empty hc count");
+    check(coli_v41_engram_gate(copies, stream_hc, key_hc, value, weight_hc, 2, 2, -1.0f) != 0,
+          "gate refuses a negative eps");
+}
+
 /* The n-gram hash ids, against the golden vectors generated from the verified
  * layout. These are the ids that index a 94.4 GiB table, so a single wrong bit is a
  * different model: the addressing is checked here rather than assumed, and the same
@@ -369,6 +461,8 @@ int main(void) {
     test_router();
     test_swiglu_clamp();
     test_engram_token_map();
+    test_engram_fetch();
+    test_engram_contribution();
     test_engram_hash();
     test_engram_compress();
     if (failures) {
