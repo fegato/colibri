@@ -11,6 +11,10 @@ extern "C" {
 /* ---- config ---- */
 
 #define COLI_V41_MAX_LAYERS 128
+/* V4.1 source tables: kv and index sources come from the config, as do the
+ * engram and DSpark layer lists. */
+#define COLI_V41_MAX_SOURCE_LAYERS 32
+#define COLI_V41_MAX_ENGRAM_LAYERS 8
 
 typedef struct {
     int hidden_size;
@@ -29,7 +33,8 @@ typedef struct {
     int num_experts_per_tok;
     int n_shared_experts;
     int moe_intermediate_size;
-    int num_hash_layers;
+    int num_hash_layers;   /* V4.1 dropped token-id hash routing: must stay 0 */
+    int num_key_value_heads;
     int num_nextn_predict_layers;
     int dspark_block_size;
     int dspark_noise_token_id;
@@ -41,6 +46,36 @@ typedef struct {
     int original_max_position_embeddings;
     int compress_ratio_count;
     int compress_ratios[COLI_V41_MAX_LAYERS];
+    /* V41 DELTA: shared KV / index (docs/deepseek-v41-delta.md). Only the
+     * kv_source layers own a compressor and the index keys; the index_source
+     * layers run an indexer and publish the top-k that the layers between them
+     * reuse. Compress ratio > 0 does not make a layer an owner. */
+    int kv_source_layer_ids[COLI_V41_MAX_SOURCE_LAYERS];
+    int kv_source_layer_count;
+    int index_source_layer_ids[COLI_V41_MAX_SOURCE_LAYERS];
+    int index_source_layer_count;
+    int candidate_source_layer_id;      /* -1 = none */
+    int candidate_topk_blocks;
+    int candidate_block_size;
+    /* V41 DELTA: engram n-gram tables. ~3.8e8 rows of 256 fp8 per layer:
+     * memory-mapped, never resident (see the delta doc). */
+    int engram_layer_ids[COLI_V41_MAX_ENGRAM_LAYERS];
+    int engram_layer_count;
+    int engram_num_embeddings[COLI_V41_MAX_ENGRAM_LAYERS];
+    int engram_max_ngram_size;
+    int engram_vocab_size;
+    int engram_n_heads;
+    int engram_head_dim;
+    int engram_compressed_vocab_size;
+    int engram_pad_token_id;
+    /* V41 DELTA: DSpark predict layers. The stages are heterogeneous: stage 0
+     * carries the target-state projection, the last one the markov and
+     * confidence heads. */
+    int dspark_target_layer_ids[COLI_V41_MAX_ENGRAM_LAYERS];
+    int dspark_target_layer_count;
+    int dspark_n_routed_experts;
+    int dspark_num_experts_per_tok;
+    int vision_enabled;
     float rms_norm_eps;
     float hc_eps;
     float routed_scaling_factor;

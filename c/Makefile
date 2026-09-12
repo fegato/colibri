@@ -497,9 +497,9 @@ TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
-# V41 DELTA: tests/test_deepseek_v41.c lands with the config/routing deltas; the
-# rule below is already here so `make tests/test_deepseek_v41` works the moment the
-# file is added, and this block moves the test into the gate list at that point.
+ifeq ($(COLI_V41_SUPPORTED),1)
+TEST_BINS += tests/test_deepseek_v41$(EXE)
+endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
@@ -1080,14 +1080,7 @@ deepseek-v41-clean:
 V41_TEST_LINK_OBJS = \
 	COLI_V41_UNIT_ST.o \
 	COLI_V41_UNIT_CONFIG.o \
-	COLI_V41_UNIT_MATH.o \
-	COLI_V41_UNIT_SPARSE_ATTENTION.o \
-	COLI_V41_UNIT_RESOURCE_PLAN.o \
-	COLI_V41_UNIT_PROMPT.o \
-	COLI_V41_UNIT_EXPERT_ROWS16.o \
-	COLI_V41_UNIT_NATIVE_QUANT.o \
-	COLI_V41_UNIT_NATIVE_QUANT_DUAL.o \
-	COLI_V41_UNIT_NATIVE_QUANT_ROWS16.o
+	COLI_V41_UNIT_MATH.o
 
 tests/test_deepseek_v41$(EXE): tests/test_deepseek_v41.c deepseek_v41.c deepseek_v41.h \
 		Makefile.deepseek-v41.units Makefile.deepseek-v41

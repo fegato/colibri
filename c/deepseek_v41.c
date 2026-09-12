@@ -12,6 +12,10 @@
  * anything larger falls back to malloc exactly like before this change. */
 #define COLI_V41_ROUTE_STACK_EXPERTS 512
 
+/* Capability gates: 0 = the mechanism is not ported yet, so the config parser
+ * refuses a checkpoint that needs it. Flip to 1 together with the port. */
+#define COLI_V41_ENGRAM_IMPLEMENTED 0
+
 #ifdef COLI_V41_UNIT_ST
 /* Shared st.h adapter and V4 tensor materialization helpers. */
 #include "deepseek_v41_internal.h"
@@ -15648,67 +15652,118 @@ static int require_string(jval *root, const char *name, const char *expected,
     return 0;
 }
 
+/* Read an int array of at most `cap` entries; -1 when the array is malformed. */
+static int v41_config_int_array(const jval *node, int *output, int cap) {
+    if (!node)
+        return 0;               /* absent: the family simply has none */
+    if (node->t != J_ARR || node->len > cap)
+        return -1;
+    if (node->len == 0)
+        return 0;               /* empty: same meaning as absent, and a tiny fixture
+                                 * relies on it (no sources, no engram layers) */
+    for (int index = 0; index < node->len; index++) {
+        if (json_int_value(node->kids[index], &output[index]) != 0)
+            return -1;
+    }
+    return node->len;
+}
+
 int coli_v41_config_parse(ColiDeepSeekV41Config *config, const char *json,
-                         char *error, size_t error_size) {
+                          char *error, size_t error_size) {
     if (!config || !json)
-        return set_error(error, error_size, "invalid DeepSeek-V4 config arguments");
+        return set_error(error, error_size, "invalid DeepSeek-V4.1 config arguments");
     memset(config, 0, sizeof(*config));
+    config->candidate_source_layer_id = -1;
     char *arena = NULL;
     jval *root = json_parse(json, &arena);
     if (!root || root->t != J_OBJ) {
         json_free(root);
         free(arena);
-        return set_error(error, error_size, "DeepSeek-V4 config is not an object");
+        return set_error(error, error_size, "DeepSeek-V4.1 config is not an object");
     }
+    /* V41 DELTA: V4.1 nests the language model under "text_config" (V4 keeps those
+     * keys at the root) and adds a "vision_config" sibling. Every architecture key
+     * below is read from `text`; quantization_config stays at the root. */
+    jval *text = json_get(root, "text_config");
+    if (!text || text->t != J_OBJ) {
+        json_free(root);
+        free(arena);
+        return set_error(error, error_size,
+                         "DeepSeek-V4.1 config has no text_config object");
+    }
+    config->vision_enabled = json_get(root, "vision_config") != NULL;
+    jval *quantization = json_get(root, "quantization_config");
     int failed =
         require_string(root, "model_type", "deepseek_v41", error, error_size) ||
-        require_string(root, "expert_dtype", "fp4", error, error_size) ||
-        require_string(root, "scoring_func", "sqrtsoftplus", error, error_size) ||
-        require_string(root, "topk_method", "noaux_tc", error, error_size) ||
-        required_int(root, "hidden_size", &config->hidden_size, error, error_size) ||
-        required_int(root, "num_hidden_layers", &config->num_hidden_layers, error, error_size) ||
-        required_int(root, "num_attention_heads", &config->num_attention_heads, error, error_size) ||
-        required_int(root, "head_dim", &config->head_dim, error, error_size) ||
-        required_int(root, "q_lora_rank", &config->q_lora_rank, error, error_size) ||
-        required_int(root, "qk_rope_head_dim", &config->qk_rope_head_dim, error, error_size) ||
-        required_int(root, "o_groups", &config->o_groups, error, error_size) ||
-        required_int(root, "o_lora_rank", &config->o_lora_rank, error, error_size) ||
-        required_int(root, "sliding_window", &config->sliding_window, error, error_size) ||
-        required_int(root, "index_n_heads", &config->index_n_heads, error, error_size) ||
-        required_int(root, "index_head_dim", &config->index_head_dim, error, error_size) ||
-        required_int(root, "index_topk", &config->index_topk, error, error_size) ||
-        required_int(root, "n_routed_experts", &config->n_routed_experts, error, error_size) ||
-        required_int(root, "num_experts_per_tok", &config->num_experts_per_tok, error, error_size) ||
-        required_int(root, "n_shared_experts", &config->n_shared_experts, error, error_size) ||
-        required_int(root, "moe_intermediate_size", &config->moe_intermediate_size, error, error_size) ||
-        required_int(root, "num_hash_layers", &config->num_hash_layers, error, error_size) ||
-        required_int(root, "num_nextn_predict_layers", &config->num_nextn_predict_layers, error, error_size) ||
-        required_int(root, "hc_mult", &config->hc_mult, error, error_size) ||
-        required_int(root, "hc_sinkhorn_iters", &config->hc_sinkhorn_iters, error, error_size) ||
-        required_int(root, "vocab_size", &config->vocab_size, error, error_size) ||
-        required_int(root, "max_position_embeddings", &config->max_position_embeddings, error, error_size) ||
-        required_float(root, "rms_norm_eps", &config->rms_norm_eps, error, error_size) ||
-        required_float(root, "hc_eps", &config->hc_eps, error, error_size) ||
-        required_float(root, "routed_scaling_factor", &config->routed_scaling_factor, error, error_size) ||
-        required_float(root, "swiglu_limit", &config->swiglu_limit, error, error_size) ||
-        required_float(root, "rope_theta", &config->rope_theta, error, error_size) ||
-        required_float(root, "compress_rope_theta", &config->compress_rope_theta, error, error_size);
+        required_int(text, "hidden_size", &config->hidden_size, error, error_size) ||
+        required_int(text, "num_hidden_layers", &config->num_hidden_layers, error, error_size) ||
+        required_int(text, "num_attention_heads", &config->num_attention_heads, error, error_size) ||
+        required_int(text, "head_dim", &config->head_dim, error, error_size) ||
+        required_int(text, "q_lora_rank", &config->q_lora_rank, error, error_size) ||
+        required_int(text, "qk_rope_head_dim", &config->qk_rope_head_dim, error, error_size) ||
+        required_int(text, "o_groups", &config->o_groups, error, error_size) ||
+        required_int(text, "o_lora_rank", &config->o_lora_rank, error, error_size) ||
+        required_int(text, "sliding_window", &config->sliding_window, error, error_size) ||
+        required_int(text, "index_n_heads", &config->index_n_heads, error, error_size) ||
+        required_int(text, "index_head_dim", &config->index_head_dim, error, error_size) ||
+        required_int(text, "index_topk", &config->index_topk, error, error_size) ||
+        required_int(text, "n_routed_experts", &config->n_routed_experts, error, error_size) ||
+        required_int(text, "num_experts_per_tok", &config->num_experts_per_tok, error, error_size) ||
+        required_int(text, "n_shared_experts", &config->n_shared_experts, error, error_size) ||
+        required_int(text, "moe_intermediate_size", &config->moe_intermediate_size, error, error_size) ||
+        required_int(text, "num_nextn_predict_layers", &config->num_nextn_predict_layers, error, error_size) ||
+        required_int(text, "hc_mult", &config->hc_mult, error, error_size) ||
+        required_int(text, "hc_sinkhorn_iters", &config->hc_sinkhorn_iters, error, error_size) ||
+        required_int(text, "vocab_size", &config->vocab_size, error, error_size) ||
+        required_int(text, "max_position_embeddings", &config->max_position_embeddings, error, error_size) ||
+        required_int(text, "engram_max_ngram_size", &config->engram_max_ngram_size, error, error_size) ||
+        required_int(text, "engram_vocab_size", &config->engram_vocab_size, error, error_size) ||
+        required_int(text, "engram_n_heads", &config->engram_n_heads, error, error_size) ||
+        required_int(text, "engram_head_dim", &config->engram_head_dim, error, error_size) ||
+        required_int(text, "engram_compressed_vocab_size", &config->engram_compressed_vocab_size, error, error_size) ||
+        required_int(text, "engram_pad_token_id", &config->engram_pad_token_id, error, error_size) ||
+        required_int(text, "dspark_n_routed_experts", &config->dspark_n_routed_experts, error, error_size) ||
+        required_int(text, "dspark_num_experts_per_tok", &config->dspark_num_experts_per_tok, error, error_size) ||
+        required_int(text, "candidate_source_layer_id", &config->candidate_source_layer_id, error, error_size) ||
+        required_int(text, "candidate_topk_blocks", &config->candidate_topk_blocks, error, error_size) ||
+        required_int(text, "candidate_block_size", &config->candidate_block_size, error, error_size) ||
+        required_float(text, "rms_norm_eps", &config->rms_norm_eps, error, error_size) ||
+        required_float(text, "hc_eps", &config->hc_eps, error, error_size) ||
+        required_float(text, "routed_scaling_factor", &config->routed_scaling_factor, error, error_size) ||
+        required_float(text, "swiglu_limit", &config->swiglu_limit, error, error_size) ||
+        required_float(text, "rope_theta", &config->rope_theta, error, error_size) ||
+        required_float(text, "compress_rope_theta", &config->compress_rope_theta, error, error_size) ||
+        require_string(text, "scoring_func", "sqrtsoftplus", error, error_size) ||
+        require_string(text, "topk_method", "noaux_tc", error, error_size);
     if (failed) {
         json_free(root);
         free(arena);
         return -1;
     }
-    if (optional_int(root, "dspark_block_size", &config->dspark_block_size,
+    /* V4.1 has no token-id hash routing: V4's num_hash_layers/tid2eid are gone,
+     * replaced by the engram tables. Accept the key only as a zero. */
+    if (optional_int(text, "num_hash_layers", &config->num_hash_layers,
+                     error, error_size) || config->num_hash_layers != 0) {
+        json_free(root);
+        free(arena);
+        return set_error(error, error_size,
+                         "DeepSeek-V4.1 has no token-id hash layers "
+                         "(num_hash_layers must be absent or 0)");
+    }
+    if (optional_int(text, "num_key_value_heads", &config->num_key_value_heads,
+                     error, error_size) || config->num_key_value_heads < 1)
+        config->num_key_value_heads = 1;
+    if (optional_int(text, "dspark_block_size", &config->dspark_block_size,
                      error, error_size) ||
-        optional_int(root, "dspark_noise_token_id",
-                     &config->dspark_noise_token_id, error, error_size) ||
-        optional_int(root, "dspark_markov_rank",
-                     &config->dspark_markov_rank, error, error_size)) {
+        optional_int(text, "dspark_noise_token_id", &config->dspark_noise_token_id,
+                     error, error_size) ||
+        optional_int(text, "dspark_markov_rank", &config->dspark_markov_rank,
+                     error, error_size)) {
         json_free(root);
         free(arena);
         return -1;
     }
-    jval *rope = json_get(root, "rope_scaling");
+    jval *rope = json_get(text, "rope_scaling");
     if (!rope || rope->t != J_OBJ ||
         required_int(rope, "original_max_position_embeddings",
                      &config->original_max_position_embeddings, error, error_size) ||
@@ -15719,7 +15774,105 @@ int coli_v41_config_parse(ColiDeepSeekV41Config *config, const char *json,
         free(arena);
         return -1;
     }
-    jval *ratios = json_get(root, "compress_ratios");
+    /* V41 DELTA: the source tables. These are what make V4.1 a different model from
+     * V4 even where the tensor shapes agree, so a config without them is a config
+     * this engine must not run. */
+    config->kv_source_layer_count =
+        v41_config_int_array(json_get(text, "kv_source_layer_ids"),
+                             config->kv_source_layer_ids, COLI_V41_MAX_SOURCE_LAYERS);
+    config->index_source_layer_count =
+        v41_config_int_array(json_get(text, "index_source_layer_ids"),
+                             config->index_source_layer_ids, COLI_V41_MAX_SOURCE_LAYERS);
+    config->engram_layer_count =
+        v41_config_int_array(json_get(text, "engram_layer_ids"),
+                             config->engram_layer_ids, COLI_V41_MAX_ENGRAM_LAYERS);
+    if (config->kv_source_layer_count < 0 || config->index_source_layer_count < 0 ||
+        config->engram_layer_count < 0) {
+        json_free(root);
+        free(arena);
+        return set_error(error, error_size, "invalid DeepSeek-V4.1 source layer table");
+    }
+    /* Source tables are ordered and in range: the reference resolves "the nearest
+     * earlier source", so an unsorted or out-of-range table silently shares the
+     * wrong KV and index. Index sources must cover the KV sources (the index keys
+     * are derived from the same compressed latent). */
+    int total_layers = config->num_hidden_layers + config->num_nextn_predict_layers;
+    for (int index = 0; index < config->kv_source_layer_count; index++) {
+        int layer = config->kv_source_layer_ids[index];
+        if (layer < 0 || layer >= config->num_hidden_layers ||
+            (index > 0 && layer <= config->kv_source_layer_ids[index - 1])) {
+            json_free(root);
+            free(arena);
+            return set_error(error, error_size,
+                             "kv_source_layer_ids must be sorted, unique and inside the "
+                             "backbone (bad entry %d)", layer);
+        }
+    }
+    for (int index = 0; index < config->index_source_layer_count; index++) {
+        int layer = config->index_source_layer_ids[index];
+        if (layer < 0 || layer >= config->num_hidden_layers ||
+            (index > 0 && layer <= config->index_source_layer_ids[index - 1])) {
+            json_free(root);
+            free(arena);
+            return set_error(error, error_size,
+                             "index_source_layer_ids must be sorted, unique and inside "
+                             "the backbone (bad entry %d)", layer);
+        }
+    }
+    for (int index = 0; index < config->kv_source_layer_count; index++) {
+        int layer = config->kv_source_layer_ids[index], found = 0;
+        for (int other = 0; other < config->index_source_layer_count; other++)
+            if (config->index_source_layer_ids[other] == layer) found = 1;
+        if (!found) {
+            json_free(root);
+            free(arena);
+            return set_error(error, error_size,
+                             "kv source layer %d is not an index source: the index keys "
+                             "come from the same compressed latent", layer);
+        }
+    }
+    if (config->candidate_source_layer_id >= total_layers) {
+        json_free(root);
+        free(arena);
+        return set_error(error, error_size,
+                         "candidate_source_layer_id %d is outside the model",
+                         config->candidate_source_layer_id);
+    }
+    {
+        int compressing = 0;
+        for (int layer = 0; layer < config->num_hidden_layers; layer++)
+            if (config->compress_ratios[layer] > 0) compressing = 1;
+        if (compressing && config->kv_source_layer_count < 1) {
+            json_free(root);
+            free(arena);
+            return set_error(error, error_size,
+                             "layers consume compressed KV but no kv_source_layer_ids "
+                             "own a compressor");
+        }
+    }
+    if (config->engram_layer_count > 0) {
+        jval *rows = json_get(text, "engram_num_embeddings");
+        int count = v41_config_int_array(rows, config->engram_num_embeddings,
+                                         COLI_V41_MAX_ENGRAM_LAYERS);
+        if (count != config->engram_layer_count) {
+            json_free(root);
+            free(arena);
+            return set_error(error, error_size,
+                             "engram_num_embeddings does not match engram_layer_ids");
+        }
+    }
+    jval *targets = json_get(text, "dspark_target_layer_ids");
+    if (targets && targets->t == J_ARR) {
+        int count = v41_config_int_array(targets, config->dspark_target_layer_ids,
+                                         COLI_V41_MAX_ENGRAM_LAYERS);
+        if (count < 0) {
+            json_free(root);
+            free(arena);
+            return set_error(error, error_size, "invalid dspark_target_layer_ids");
+        }
+        config->dspark_target_layer_count = count;
+    }
+    jval *ratios = json_get(text, "compress_ratios");
     if (!ratios || ratios->t != J_ARR || ratios->len < 1 ||
         ratios->len > COLI_V41_MAX_LAYERS) {
         json_free(root);
@@ -15729,16 +15882,19 @@ int coli_v41_config_parse(ColiDeepSeekV41Config *config, const char *json,
     config->compress_ratio_count = ratios->len;
     for (int index = 0; index < ratios->len; index++) {
         if (json_int_value(ratios->kids[index],
-                           &config->compress_ratios[index]) != 0) {
+                           &config->compress_ratios[index]) != 0 ||
+            config->compress_ratios[index] < 0 ||
+            config->compress_ratios[index] > 8) {
             json_free(root);
             free(arena);
             return set_error(error, error_size, "invalid compress ratio");
         }
     }
-    jval *quantization = json_get(root, "quantization_config");
     if (!quantization || quantization->t != J_OBJ ||
-        require_string(quantization, "fmt", "e4m3", error, error_size) ||
-        require_string(quantization, "scale_fmt", "ue8m0", error, error_size)) {
+        require_string(quantization, "scale_fmt", "ue8m0", error, error_size) ||
+        require_string(quantization, "expert_dtype", "fp4", error, error_size) ||
+        (json_get(quantization, "fmt") != NULL &&
+         require_string(quantization, "fmt", "e4m3", error, error_size))) {
         json_free(root);
         free(arena);
         return -1;
@@ -15748,16 +15904,18 @@ int coli_v41_config_parse(ColiDeepSeekV41Config *config, const char *json,
         config->num_experts_per_tok < 1 ||
         config->num_experts_per_tok > config->n_routed_experts ||
         config->n_shared_experts != 1 || config->hc_mult < 1 ||
-        config->compress_ratio_count < config->num_hidden_layers) {
+        config->compress_ratio_count <
+            config->num_hidden_layers + config->num_nextn_predict_layers) {
         json_free(root);
         free(arena);
-        return set_error(error, error_size, "inconsistent DeepSeek-V4 config dimensions");
+        return set_error(error, error_size,
+                         "inconsistent DeepSeek-V4.1 config dimensions");
     }
     /* SEC (GHSA-7654): rope vs head/index-head cross relationship. The per-field
      * checks above never compared qk_rope_head_dim against index_head_dim; when
      * qk_rope_head_dim > index_head_dim the indexer/compressor computed the RoPE
-     * sub-vector pointer as `output + index_head_dim - qk_rope_head_dim` — a
-     * negative offset — and rotated/rounded bf16 to the left of the heap block.
+     * sub-vector pointer as `output + index_head_dim - qk_rope_head_dim` -- a
+     * negative offset -- and rotated/rounded bf16 to the left of the heap block.
      * No weight tensor carries the rope dim, so a benign snapshot + a tampered
      * config.json alone reaches this. */
     if (config->head_dim < 1 || config->index_head_dim < 1 ||
@@ -15766,8 +15924,23 @@ int coli_v41_config_parse(ColiDeepSeekV41Config *config, const char *json,
         config->qk_rope_head_dim > config->index_head_dim) {
         json_free(root);
         free(arena);
-        return set_error(error, error_size, "inconsistent DeepSeek-V4 rope/index head dims");
+        return set_error(error, error_size,
+                         "inconsistent DeepSeek-V4.1 rope/index head dims");
     }
+    /* Fail closed on every mechanism this engine does not implement yet, keyed on
+     * what the checkpoint itself declares and never on an assumption: running V4.1
+     * without a mechanism computes a different model. Each gate goes away with the
+     * mechanism that satisfies it -- docs/deepseek-v41-delta.md. */
+#if !COLI_V41_ENGRAM_IMPLEMENTED
+    if (config->engram_layer_count > 0) {
+        json_free(root);
+        free(arena);
+        return set_error(error, error_size,
+                         "cfg refuses: %d engram layer(s) declared and the n-gram path "
+                         "is not implemented yet; dropping the engram contribution "
+                         "would compute a different model", config->engram_layer_count);
+    }
+#endif
     json_free(root);
     free(arena);
     return 0;
