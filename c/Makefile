@@ -1083,6 +1083,7 @@ deepseek-v41-clean:
 # It links CPU units only -- the V4.1 CUDA tier does not exist yet and must not
 # be resolved through the V4 one (Makefile.deepseek-v41 has the reasoning).
 V41_TEST_LINK_OBJS = \
+	COLI_V41_UNIT_LAYER.o \
 	COLI_V41_UNIT_ST.o \
 	COLI_V41_UNIT_CONFIG.o \
 	COLI_V41_UNIT_MATH.o \

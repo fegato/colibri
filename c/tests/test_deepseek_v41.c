@@ -746,11 +746,42 @@ static void test_engram_compress(void) {
           "engram layer ids map onto the layout positions");
 }
 
+/* The plan declares the scales the *checkpoint* stores. In the test config wq_a is
+ * [q_lora_rank 16, hidden 64], so with the checkpoint's 32x32 tile its scale is
+ * [ceil(16/32), ceil(64/32)] = [1, 2]; V4's 128-wide rule would have declared [1, 1],
+ * i.e. the plan validated a scale nobody stores and refused a real V4.1 checkpoint
+ * (and every fixture) before reading a single weight. */
+static void test_plan_fp8_geometry(void) {
+    ColiDeepSeekV41Config config;
+    char error[256] = {0};
+    /* the same rewrite the other config checks do: the engram layers are cleared so the
+     * capability gate is not what is being tested here */
+    char *json = rewrite(V41_CONFIG, "\"engram_layer_ids\":[1]", "\"engram_layer_ids\":[]");
+    json = rewrite(json, "\"engram_num_embeddings\":[1000]", "\"engram_num_embeddings\":[]");
+    if (parse(json, &config, error, sizeof(error)) != 0) {
+        check(0, "the config parses before the plan geometry is checked");
+        return;
+    }
+    ColiDeepSeekV41LayerPlan plan;
+    check(coli_v41_layer_plan(&plan, &config, 0, error, sizeof(error)) == 0,
+          "the layer plan builds");
+    const ColiDeepSeekV41TensorSpec *scale = NULL;
+    for (size_t i = 0; i < plan.tensor_count; i++)
+        if (plan.tensors[i].dtype == COLI_ST_F8_E8M0 && plan.tensors[i].rank == 2 &&
+            strcmp(plan.tensors[i].name, "layers.0.attn.wq_a.scale") == 0)
+            scale = &plan.tensors[i];
+    check(scale != NULL, "the plan declares wq_a's scale");
+    if (scale)
+        check(scale->shape[0] == 1 && scale->shape[1] == 2,
+              "the plan's wq_a scale is the checkpoint's 32x32 tile, not V4's 128");
+}
+
 int main(void) {
     /* unbuffered: if something crashes, the last line says where */
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("deepseek_v41 contract\n");
     test_config_shape();
+    test_plan_fp8_geometry();
     test_engram_gate();
     test_source_table_validation();
     test_router();

@@ -652,8 +652,13 @@ static int add_fp8(ColiDeepSeekV41LayerPlan *plan, int64_t rows, int64_t columns
     snprintf(name, sizeof(name), "%s.weight", prefix);
     if (add_2d(plan, COLI_ST_F8_E4M3, rows, columns, name, error, size) != 0) return -1;
     snprintf(name, sizeof(name), "%s.scale", prefix);
-    return add_2d(plan, COLI_ST_F8_E8M0, (rows + 127) / 128,
-                  (columns + 127) / 128, name, error, size);
+    if (plan->fp8_block_rows < 1 || plan->fp8_block_columns < 1)
+        return set_error(error, size,
+                         "the plan has no fp8 block geometry: it is set from the config");
+    return add_2d(plan, COLI_ST_F8_E8M0,
+                  (rows + plan->fp8_block_rows - 1) / plan->fp8_block_rows,
+                  (columns + plan->fp8_block_columns - 1) / plan->fp8_block_columns,
+                  name, error, size);
 }
 
 #define ADD(call) do { if ((call) != 0) return -1; } while (0)
@@ -666,6 +671,10 @@ int coli_v41_layer_plan(ColiDeepSeekV41LayerPlan *plan,
         return set_error(error, error_size, "invalid DeepSeek-V4 layer plan arguments");
     memset(plan, 0, sizeof(*plan));
     plan->layer = layer;
+    /* The scale tile this checkpoint stores, not a constant: every fp8 tensor below
+     * declares its scales in this geometry (docs/deepseek-v41-delta.md). */
+    plan->fp8_block_rows = config->fp8_block_rows;
+    plan->fp8_block_columns = config->fp8_block_columns;
     plan->compression_ratio = config->compress_ratios[layer];
     plan->uses_hash_router = layer < config->num_hash_layers;
     plan->has_compressor = plan->compression_ratio != 0;
@@ -15933,8 +15942,13 @@ static int add_fp8(ColiDeepSeekV41LayerPlan *plan, int64_t rows, int64_t columns
     snprintf(name, sizeof(name), "%s.weight", prefix);
     if (add_2d(plan, COLI_ST_F8_E4M3, rows, columns, name, error, size) != 0) return -1;
     snprintf(name, sizeof(name), "%s.scale", prefix);
-    return add_2d(plan, COLI_ST_F8_E8M0, (rows + 127) / 128,
-                  (columns + 127) / 128, name, error, size);
+    if (plan->fp8_block_rows < 1 || plan->fp8_block_columns < 1)
+        return set_error(error, size,
+                         "the plan has no fp8 block geometry: it is set from the config");
+    return add_2d(plan, COLI_ST_F8_E8M0,
+                  (rows + plan->fp8_block_rows - 1) / plan->fp8_block_rows,
+                  (columns + plan->fp8_block_columns - 1) / plan->fp8_block_columns,
+                  name, error, size);
 }
 
 #define ADD(call) do { if ((call) != 0) return -1; } while (0)
@@ -15947,6 +15961,10 @@ int coli_v41_layer_plan(ColiDeepSeekV41LayerPlan *plan,
         return set_error(error, error_size, "invalid DeepSeek-V4 layer plan arguments");
     memset(plan, 0, sizeof(*plan));
     plan->layer = layer;
+    /* The scale tile this checkpoint stores, not a constant: every fp8 tensor below
+     * declares its scales in this geometry (docs/deepseek-v41-delta.md). */
+    plan->fp8_block_rows = config->fp8_block_rows;
+    plan->fp8_block_columns = config->fp8_block_columns;
     plan->compression_ratio = config->compress_ratios[layer];
     plan->uses_hash_router = layer < config->num_hash_layers;
     plan->has_compressor = plan->compression_ratio != 0;

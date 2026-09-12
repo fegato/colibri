@@ -491,10 +491,11 @@ E8M0 scales for a 256-wide row.
 
 The config now carries it rather than assuming it: `weight_block_size` is read from the
 checkpoint into `fp8_block_rows`/`fp8_block_columns`, and any width but the verified 32 is
-refused at parse time with the reason spelled out -- the vectorized matvec and the loader
-still hardcode V4's 128, so accepting 128 here would dequantize every dense weight with the
-wrong scale and say nothing. The gate goes away with the loader and the matvec taking the
-width from the view.
+refused at parse time with the reason spelled out. The **plan** then declares its scales in that
+geometry too (`add_fp8` declared `(rows + 127) / 128`, so a real checkpoint -- or a fixture --
+failed validation before a single weight was read), and the runtime views take it from the scale
+tensor they were handed. The contract test pins the plan's side: in its config `wq_a` is
+`[16, 64]`, whose scale is `[1, 2]` in 32x32 blocks and `[1, 1]` under V4's rule.
 
 So the dense path is a **blocker for any V4.1 layer**: run it as-is and the engine
 would read the wrong scale for every weight it touches. The engram projection does

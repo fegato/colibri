@@ -275,6 +275,11 @@ typedef struct {
 
 typedef struct {
     int layer;
+    /* The fp8 scale tile the checkpoint stores (V4.1: 32x32), straight from the config:
+     * every scale shape the plan declares follows it, so a plan built for one geometry
+     * cannot be validated against another. */
+    int64_t fp8_block_rows;
+    int64_t fp8_block_columns;
     int compression_ratio;
     int uses_hash_router;
     int has_compressor;
