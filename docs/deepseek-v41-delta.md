@@ -201,6 +201,50 @@ Two consequences for the port:
   this documented fp4-to-fp8 cast at load time. It is a transformation, not an external tool,
   and the delta doc should say so rather than let the earlier wording stand.
 
+## The layout map, held to the checkpoint and to the loader
+
+`tools/deepseek_v41_layout.py` is the map the expert pin and the tiny fixture generator are
+both written from: family -> shape -> encoding, derived from the config, with a `--check` mode
+that holds it to the released headers and an `--engine` mode that diffs it against the names the
+ported engine's loader actually declares (the per-layer plan's `add_*` calls, the expert store's
+`layers.%d.ffn.experts.%d.%s.weight` builder, and every other name literal in the source).
+
+Three encodings exist in this checkpoint and only three:
+
+| encoding | families | scale |
+| --- | --- | --- |
+| fp8 e4m3 | every dense weight, the engram's `wkv`, `shared_experts.*`, DSpark `main_proj` | UE8M0, one exponent per **32x32** block |
+| fp8 e4m3, per-row scale | the engram table `engram.embed.weight` | UE8M0, one exponent per row per 32 columns (`[rows, 8]`) |
+| packed fp4 (I8, 2 values/byte along K) | the routed experts, backbone and DSpark | UE8M0, one exponent per row per 32 columns |
+
+Held to the released checkpoint it classifies **96,085 tensors (48,496 weights + 47,589
+scales)** with no shape or dtype disagreement and no unclassified name.
+
+The same run settles two claims the port rests on:
+
+- **"Native load, no converter"** is about names: the checkpoint already carries the
+  converter's own vocabulary. `convert.py`'s seven `mapping` keys do match 333 tensor names,
+  but every one of those is an *identity* rename (`wq_b` -> `wq_b`), and `mlp`->`ffn`,
+  `self_attn`->`attn`, `weight_scale_inv`->`scale`, `e_score_correction_bias`->`bias` never
+  fire at all. The one transformation a loader must perform is the experts' fp4 range (above).
+- **The loader is still asking V4's questions.** Eleven families the engine declares do not
+  exist in a V4.1 checkpoint:
+
+  | the loader asks for | why it is not in the checkpoint |
+  | --- | --- |
+  | `attn.compressor.ape` | V4's compressor had a learned positional table; V4.1's has none |
+  | `attn.indexer.compressor.{ape,norm,wgate,wkv}` | V4.1's compressor is `attn.compressor.*`, owned by the KV source layer, not by the indexer |
+  | `ffn.gate.tid2eid` | token-id hash routing is gone (zero `tid2eid` tensors) |
+  | `hc_head_{base,fn,scale}` | the head cache still reads V4's name for the final norm's hyper-connection |
+  | `mtp.N.markov_head.markov_w1/w2` | V4.1's DSpark head is `markov_head.{embed,head}` |
+
+  and thirty families it never asks for -- the mechanisms still to wire: `engram.*`,
+  `attn.indexer.{wk,k_norm}`, `ffn.gate.bias_vl`, the DSpark head's `main_norm` / `norm` /
+  `markov_head.*`, plus the vision tower and its aligner (deliberate).
+
+  The plan's scale rule is the other half of the same finding: `add_fp8` declares
+  `(rows + 127) / 128`, a 128x128 block, for every fp8 tensor it names.
+
 ## Shared KV / index: the exact mechanism
 
 From the reference (`ref:500-580`, `ref:722-778`):
