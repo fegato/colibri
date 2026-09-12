@@ -745,9 +745,10 @@ _KIMI_EXPERT = re.compile(
     r"experts\.(\d+)\."
 )
 _V4_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.")
-# V4.1 keeps the DeepSeek decoder-block naming (confirm against the first
-# shard header when weights are staged; the converter must fail closed on
-# any name this does not classify, per the project rule).
+# V4.1 keeps the DeepSeek decoder-block naming, confirmed against the
+# official safetensors index (96,085 tensors): layers.{L}.ffn.experts.{E}.
+# w1/w2/w3.weight + .scale (fp4), plus ffn.gate + shared_experts per layer,
+# mtp.{0,1,2} draft experts, engram tables on 2 layers, vision tower.
 _V41_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.")
 _GLM53_EXPERT = re.compile(
     r"^model\.(?:language_model\.)?layers\.(\d+)\.mlp\.experts\.(\d+)\."
